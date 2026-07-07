@@ -1,0 +1,3 @@
+NAMESPACE="awx"
+DATABASE="awx"
+DBUSER="awx"
