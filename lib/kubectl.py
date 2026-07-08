@@ -716,4 +716,3 @@ class Kubectl:
         if "-o" not in args and "--output" not in args:
             args += ["-o", "yaml"]
         return self.run(args, **kwargs)
-
