@@ -31,7 +31,6 @@ _REQUIRED_SECTIONS: dict[str, type] = {
     "backup": dict,
     "awx": dict,
     "postgres": dict,
-    "archive": dict,
     "database": dict,
     "secrets": dict,
     "checksums": dict,
@@ -43,7 +42,6 @@ _SECTION_KEYS: dict[str, list[str]] = {
     "backup": ["created", "hostname", "namespace", "format"],
     "awx": ["version", "operator_version"],
     "postgres": ["version", "database", "database_size"],
-    "archive": ["filename", "size"],
     "database": ["filename", "sha256", "size"],
     "secrets": ["count", "names"],
 }
@@ -119,7 +117,6 @@ class Manifest:
             "backup": {},
             "awx": {},
             "postgres": {},
-            "archive": {},
             "database": {},
             "secrets": {},
             "checksums": {},
@@ -345,19 +342,6 @@ class Manifest:
         self._set_section("database", {
             "filename": filename,
             "sha256": sha256,
-            "size": size,
-        })
-
-    def set_archive(self, filename: str, size: int) -> None:
-        """Populate the ``archive`` section with tar.gz file metadata.
-
-        Args:
-            filename: Filename of the ``.tar.gz`` archive.
-            size: Size of the archive in bytes.
-        """
-        self._require(filename, "archive.filename")
-        self._set_section("archive", {
-            "filename": filename,
             "size": size,
         })
 
