@@ -37,16 +37,6 @@ class Kubectl:
     RETRY_COUNT: int = 3
     RETRY_DELAY: float = 2.0
 
-    # Kubernetes label selectors for AWX components
-    LABEL_POSTGRES: str = "app.kubernetes.io/name=postgres"
-    LABEL_WEB: str = (
-        "app.kubernetes.io/name=awx,app.kubernetes.io/component=web"
-    )
-    LABEL_TASK: str = (
-        "app.kubernetes.io/name=awx,app.kubernetes.io/component=task"
-    )
-    LABEL_OPERATOR: str = "app.kubernetes.io/name=awx-operator"
-
     def __init__(self, namespace: str = NAMESPACE) -> None:
         """Initialise a Kubectl wrapper bound to *namespace*.
 
@@ -78,32 +68,85 @@ class Kubectl:
         cmd += args
         return cmd
 
-    def _find_pod_by_label(self, label_selector: str) -> str:
-        """Return the name of the first Running pod matching *label_selector*.
+    def _running_pods(self, label_selector: str) -> list[dict[str, Any]]:
+        """Return all Running pods matching *label_selector*, oldest first."""
+        pods = self.list_pods(label_selector=label_selector)
+        running = [
+            p for p in pods
+            if p.get("status", {}).get("phase", "") == "Running"
+        ]
+        running.sort(
+            key=lambda p: p.get("metadata", {}).get("creationTimestamp", "")
+        )
+        return running
+
+    def _running_pods_by_prefix(
+        self, prefixes: list[str]
+    ) -> list[dict[str, Any]]:
+        """Return all Running pods whose name starts with any of *prefixes*, oldest first."""
+        all_pods = self.list_pods()
+        running = [
+            p for p in all_pods
+            if p.get("status", {}).get("phase", "") == "Running"
+            and any(
+                p.get("metadata", {}).get("name", "").startswith(pfx)
+                for pfx in prefixes
+            )
+        ]
+        running.sort(
+            key=lambda p: p.get("metadata", {}).get("creationTimestamp", "")
+        )
+        return running
+
+    def _find_pod(
+        self,
+        selectors: list[str],
+        prefixes: list[str],
+        description: str,
+    ) -> str:
+        """Resolve the oldest Running pod via label selectors, then name prefixes.
+
+        Tries each entry in *selectors* in order; if none yields a Running pod,
+        falls back to matching pods whose name starts with any entry in
+        *prefixes*.
 
         Args:
-            label_selector: Kubernetes label selector expression.
+            selectors: Label selector expressions to try in order.
+            prefixes: Pod-name prefixes used as last-resort fallback.
+            description: Human-readable component name used in the error message.
 
         Returns:
-            Pod name string.
+            Name of the oldest Running pod found.
 
         Raises:
-            KubectlError: If no Running pod is found.
+            KubectlError: If no Running pod is found by any strategy.
         """
-        pods = self.list_pods(label_selector=label_selector)
-        for pod in pods:
-            phase: str = pod.get("status", {}).get("phase", "")
-            if phase == "Running":
-                name: str = pod["metadata"]["name"]
+        for selector in selectors:
+            pods = self._running_pods(selector)
+            if pods:
+                name: str = pods[0]["metadata"]["name"]
                 log.debug(
-                    "Resolved pod '%s' via selector '%s'",
+                    "Resolved %s pod '%s' via selector '%s'",
+                    description,
                     name,
-                    label_selector,
+                    selector,
                 )
                 return name
+
+        pods = self._running_pods_by_prefix(prefixes)
+        if pods:
+            name = pods[0]["metadata"]["name"]
+            log.debug(
+                "Resolved %s pod '%s' via name prefix %s",
+                description,
+                name,
+                prefixes,
+            )
+            return name
+
         raise KubectlError(
-            f"No Running pod found for selector '{label_selector}' "
-            f"in namespace '{self.namespace}'"
+            f"No Running {description} pod found in namespace '{self.namespace}' "
+            f"(tried selectors {selectors} and prefixes {prefixes})"
         )
 
     # ------------------------------------------------------------------
@@ -332,7 +375,9 @@ class Kubectl:
     # ------------------------------------------------------------------
 
     def postgres_pod(self) -> str:
-        """Return the name of the Running PostgreSQL pod.
+        """Return the name of the oldest Running PostgreSQL pod.
+
+        Tries label selectors in order, then falls back to the pod-name prefix.
 
         Returns:
             Pod name.
@@ -340,10 +385,18 @@ class Kubectl:
         Raises:
             KubectlError: If no Running pod is found.
         """
-        return self._find_pod_by_label(self.LABEL_POSTGRES)
+        return self._find_pod(
+            selectors=[
+                "app.kubernetes.io/component=database",
+                "app.kubernetes.io/name=postgres-15",
+                "app.kubernetes.io/name=postgres",
+            ],
+            prefixes=["awx-postgres-"],
+            description="PostgreSQL",
+        )
 
     def web_pod(self) -> str:
-        """Return the name of the Running AWX web pod.
+        """Return the name of the oldest Running AWX web pod.
 
         Returns:
             Pod name.
@@ -351,10 +404,14 @@ class Kubectl:
         Raises:
             KubectlError: If no Running pod is found.
         """
-        return self._find_pod_by_label(self.LABEL_WEB)
+        return self._find_pod(
+            selectors=["app.kubernetes.io/name=awx-web"],
+            prefixes=["awx-web-"],
+            description="AWX web",
+        )
 
     def task_pod(self) -> str:
-        """Return the name of the Running AWX task pod.
+        """Return the name of the oldest Running AWX task pod.
 
         Returns:
             Pod name.
@@ -362,10 +419,14 @@ class Kubectl:
         Raises:
             KubectlError: If no Running pod is found.
         """
-        return self._find_pod_by_label(self.LABEL_TASK)
+        return self._find_pod(
+            selectors=["app.kubernetes.io/name=awx-task"],
+            prefixes=["awx-task-"],
+            description="AWX task",
+        )
 
     def operator_pod(self) -> str:
-        """Return the name of the Running AWX operator pod.
+        """Return the name of the oldest Running AWX operator pod.
 
         Returns:
             Pod name.
@@ -373,7 +434,11 @@ class Kubectl:
         Raises:
             KubectlError: If no Running pod is found.
         """
-        return self._find_pod_by_label(self.LABEL_OPERATOR)
+        return self._find_pod(
+            selectors=["control-plane=controller-manager"],
+            prefixes=["awx-operator-controller-manager-"],
+            description="AWX operator",
+        )
 
     # ------------------------------------------------------------------
     # Secrets
@@ -547,12 +612,11 @@ class Kubectl:
         )
         deadline = time.monotonic() + timeout
         while True:
-            try:
-                pod_name = self._find_pod_by_label(label_selector)
+            pods = self._running_pods(label_selector)
+            if pods:
+                pod_name: str = pods[0]["metadata"]["name"]
                 log.info("Pod '%s' is Running", pod_name)
                 return pod_name
-            except KubectlError:
-                pass
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise KubectlError(
