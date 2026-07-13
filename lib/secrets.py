@@ -14,11 +14,6 @@ from typing import Any
 
 from .kubectl import Kubectl, KubectlError
 
-try:
-    from .config import SECRETS
-except ImportError:
-    SECRETS: list[str] = []
-
 log: logging.Logger = logging.getLogger("awx-migration")
 
 # Metadata fields that must never appear in exported secrets
@@ -44,6 +39,12 @@ _IMPORT_PRIORITY: dict[str, int] = {
     "awx-postgres-configuration": 1,
 }
 
+# Label selector used as the primary strategy for locating AWX secrets.
+_AWX_LABEL_SELECTOR: str = "app.kubernetes.io/part-of=awx"
+
+# Name prefix used as fallback when label-based discovery returns nothing.
+_AWX_SECRET_PREFIX: str = "awx-"
+
 
 class SecretError(RuntimeError):
     """Raised on any Kubernetes Secret operation failure."""
@@ -54,7 +55,9 @@ class Secrets:
 
     All kubectl interactions are delegated to the injected
     :class:`~lib.kubectl.Kubectl` instance.  The set of managed secrets
-    is driven by :data:`~lib.config.SECRETS`.
+    is discovered dynamically at runtime — first by the Kubernetes label
+    ``app.kubernetes.io/part-of=awx``, then by the name prefix ``awx-``
+    as a fallback.  No static configuration list is required.
 
     Exported secrets have volatile metadata stripped so they can be safely
     applied to a different cluster without uid/resourceVersion conflicts.
@@ -164,6 +167,77 @@ class Secrets:
                 f"Invalid JSON in '{path}': {exc}"
             ) from exc
 
+    def _discover_awx_secrets(self) -> list[str]:
+        """Discover AWX secret names from the cluster.
+
+        Tries the label selector ``app.kubernetes.io/part-of=awx`` first.
+        Falls back to listing all secrets whose name begins with ``awx-``
+        when the label query returns no results.
+
+        Returns:
+            Sorted list of discovered secret names.
+
+        Raises:
+            SecretError: On kubectl failure or when no secrets are found.
+        """
+        try:
+            items = self._kubectl.list_secrets(
+                label_selector=_AWX_LABEL_SELECTOR
+            )
+        except KubectlError as exc:
+            raise SecretError(
+                f"Failed to list AWX secrets by label: {exc}"
+            ) from exc
+
+        if items:
+            names = sorted(
+                item["metadata"]["name"] for item in items
+            )
+            log.debug(
+                "Discovered %d AWX secret(s) via label '%s': %s",
+                len(names),
+                _AWX_LABEL_SELECTOR,
+                names,
+            )
+            return names
+
+        log.warning(
+            "No secrets found with label '%s'; "
+            "falling back to name prefix '%s'",
+            _AWX_LABEL_SELECTOR,
+            _AWX_SECRET_PREFIX,
+        )
+
+        try:
+            all_items = self._kubectl.list_secrets()
+        except KubectlError as exc:
+            raise SecretError(
+                f"Failed to list secrets for prefix fallback: {exc}"
+            ) from exc
+
+        names = sorted(
+            item["metadata"]["name"]
+            for item in all_items
+            if item["metadata"]["name"].startswith(_AWX_SECRET_PREFIX)
+        )
+
+        if not names:
+            raise SecretError(
+                f"No AWX secrets found in namespace "
+                f"'{self._kubectl.namespace}' — "
+                f"tried label '{_AWX_LABEL_SELECTOR}' and "
+                f"name prefix '{_AWX_SECRET_PREFIX}'. "
+                "Backup aborted."
+            )
+
+        log.debug(
+            "Discovered %d AWX secret(s) via prefix '%s': %s",
+            len(names),
+            _AWX_SECRET_PREFIX,
+            names,
+        )
+        return names
+
     # ------------------------------------------------------------------
     # Introspection
     # ------------------------------------------------------------------
@@ -245,23 +319,28 @@ class Secrets:
         log.debug("Secret '%s' written (%d keys)", name, len(cleaned.get("data") or {}))
 
     def export_all(self, directory: str | Path) -> list[str]:
-        """Export every secret listed in config.SECRETS to *directory*.
+        """Discover and export all AWX secrets to *directory*.
 
-        Each secret is written as ``<directory>/<name>.json``.
+        AWX secrets are discovered automatically — first by the Kubernetes
+        label ``app.kubernetes.io/part-of=awx``, then by the name prefix
+        ``awx-`` as a fallback.  Each secret is written as
+        ``<directory>/<name>.json``.
 
         Args:
             directory: Destination directory. Created if absent.
 
         Returns:
-            Names of successfully exported secrets.
+            Sorted list of names of successfully exported secrets.
 
         Raises:
-            SecretError: If any individual export fails.
+            SecretError: If no AWX secrets are found, or if any individual
+                         export fails.
         """
         dest = Path(directory)
         dest.mkdir(parents=True, exist_ok=True)
+        names = self._discover_awx_secrets()
         exported: list[str] = []
-        for name in SECRETS:
+        for name in names:
             self.export_secret(name, dest / f"{name}.json")
             exported.append(name)
         log.info("Exported %d secret(s) to '%s'", len(exported), dest)
@@ -301,6 +380,9 @@ class Secrets:
         1. ``awx-secret-key`` — must exist before the operator starts.
         2. ``awx-postgres-configuration`` — required for database connectivity.
         3. All remaining secrets in alphabetical order.
+
+        The import set is determined exclusively by the JSON files present
+        in *directory* — no static secret list is consulted.
 
         Args:
             directory: Source directory containing exported secret JSON files.
@@ -351,22 +433,24 @@ class Secrets:
             ) from exc
 
     def delete_all(self) -> list[str]:
-        """Delete every secret listed in config.SECRETS.
+        """Discover and delete all AWX secrets from the namespace.
 
-        Only the secrets defined in :data:`~lib.config.SECRETS` are removed —
-        no other secrets in the namespace are touched.
+        Uses the same label/prefix discovery as :meth:`export_all`.
+        Only secrets identified as AWX secrets are removed — no other
+        secrets in the namespace are touched.
 
         Returns:
             Names of deleted secrets.
 
         Raises:
-            SecretError: If any individual deletion fails.
+            SecretError: If discovery fails or any individual deletion fails.
         """
+        names = self._discover_awx_secrets()
         deleted: list[str] = []
-        for name in SECRETS:
+        for name in names:
             self.delete(name)
             deleted.append(name)
-        log.info("Deleted %d configured secret(s)", len(deleted))
+        log.info("Deleted %d AWX secret(s)", len(deleted))
         return deleted
 
     # ------------------------------------------------------------------
@@ -424,9 +508,10 @@ class Secrets:
     # ------------------------------------------------------------------
 
     def validate(self) -> list[str]:
-        """Check that all configured secrets are present and well-formed.
+        """Check that all discovered AWX secrets are present and well-formed.
 
-        Verifies each secret in :data:`~lib.config.SECRETS` for:
+        Discovers AWX secrets dynamically (label then prefix fallback) and
+        verifies each one for:
 
         - Existence in the namespace.
         - Non-empty ``data`` field.
@@ -438,7 +523,12 @@ class Secrets:
             List of error strings.  An empty list means all checks passed.
         """
         errors: list[str] = []
-        for name in SECRETS:
+        try:
+            names = self._discover_awx_secrets()
+        except SecretError as exc:
+            return [str(exc)]
+
+        for name in names:
             if not self.exists(name):
                 errors.append(f"Secret '{name}' not found in namespace")
                 continue

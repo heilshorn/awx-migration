@@ -370,6 +370,22 @@ class Kubectl:
             args += ["-l", label_selector]
         return self.json(args).get("items", [])
 
+    def list_secrets(
+        self, label_selector: Optional[str] = None
+    ) -> list[dict[str, Any]]:
+        """Return secrets in the namespace, optionally filtered by label.
+
+        Args:
+            label_selector: Kubernetes label selector expression.
+
+        Returns:
+            List of secret resource dicts from the API.
+        """
+        args: list[str] = ["get", "secrets", "-o", "json"]
+        if label_selector:
+            args += ["-l", label_selector]
+        return self.json(args).get("items", [])
+
     # ------------------------------------------------------------------
     # AWX component pod resolution  (label-based, never by name)
     # ------------------------------------------------------------------
