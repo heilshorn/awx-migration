@@ -29,6 +29,11 @@ _METADATA_STRIP: frozenset[str] = frozenset({
 _SECRET_KEY_NAME: str = "awx-secret-key"
 _SECRET_KEY_FIELD: str = "secret_key"
 
+_POSTGRES_CONFIG_NAME: str = "awx-postgres-configuration"
+_POSTGRES_CONFIG_REQUIRED: frozenset[str] = frozenset({
+    "host", "port", "database", "username", "password",
+})
+
 # Annotation removed from metadata before export (kubectl internal bookkeeping)
 _ANNOTATION_STRIP: str = "kubectl.kubernetes.io/last-applied-configuration"
 
@@ -482,6 +487,34 @@ class Secrets:
                 f"{sorted(data.keys())}"
             )
         return data[_SECRET_KEY_FIELD]
+
+    def postgres_config(self) -> dict[str, str]:
+        """Return the decoded ``awx-postgres-configuration`` secret.
+
+        Fetches the secret and decodes all data fields.  Raises if any of
+        the required keys (``host``, ``port``, ``database``, ``username``,
+        ``password``) are absent.
+
+        Returns:
+            Dict mapping each data key to its decoded UTF-8 value.
+
+        Raises:
+            SecretError: If the secret cannot be fetched, decoded, or is
+                         missing required fields.
+        """
+        try:
+            data = self._kubectl.get_secret(_POSTGRES_CONFIG_NAME)
+        except KubectlError as exc:
+            raise SecretError(
+                f"Failed to fetch '{_POSTGRES_CONFIG_NAME}': {exc}"
+            ) from exc
+        missing = _POSTGRES_CONFIG_REQUIRED - data.keys()
+        if missing:
+            raise SecretError(
+                f"Secret '{_POSTGRES_CONFIG_NAME}' is missing required "
+                f"fields: {sorted(missing)}"
+            )
+        return data
 
     def compare_secret_key(self, other_key: str) -> bool:
         """Compare the current AWX secret key with *other_key*.

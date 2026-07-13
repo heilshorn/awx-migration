@@ -227,6 +227,19 @@ def main() -> None:
         log.info("Restoring PostgreSQL")
         pg.restore_database(database, DBUSER, dump_file)
 
+        # Step 9b — Synchronise PostgreSQL role password from Secret
+        # pg_dump/pg_restore does not carry role passwords, so after a restore
+        # the password accepted by PostgreSQL may differ from the one stored in
+        # awx-postgres-configuration.  We read the password directly from the
+        # already-imported Secret and apply it via ALTER ROLE.
+        log.info("Synchronising PostgreSQL role password from Secret")
+        pg_cfg = sec.postgres_config()
+        pg.synchronize_role_password(
+            username=pg_cfg["username"],
+            password=pg_cfg["password"],
+            database=pg_cfg["database"],
+        )
+
         # Step 10 — Restart AWX deployments
         _restart_awx(kubectl)
 

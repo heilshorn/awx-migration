@@ -584,6 +584,93 @@ class Postgres:
             self._remove_pod_file(pod, remote)
 
     # ------------------------------------------------------------------
+    # Role password synchronisation
+    # ------------------------------------------------------------------
+
+    def synchronize_role_password(
+        self,
+        username: str,
+        password: str,
+        *,
+        database: str = "postgres",
+        verify: bool = True,
+    ) -> None:
+        """Set the PostgreSQL role password and optionally verify the change.
+
+        Executes ``ALTER ROLE <username> PASSWORD '<password>'`` as the
+        superuser (:data:`DB_ADMIN_USER`), then — when *verify* is ``True`` —
+        confirms the new password is accepted by connecting as *username*.
+
+        This step is necessary after every ``pg_restore`` because
+        ``pg_dump``/``pg_restore`` do not carry role passwords.  Without
+        synchronisation the password stored in the Kubernetes Secret and the
+        one accepted by PostgreSQL diverge, which prevents AWX from starting.
+
+        Args:
+            username: PostgreSQL role whose password should be updated.
+            password: New plaintext password (read from the Kubernetes Secret,
+                      never hard-coded).
+            database: Database used for the ALTER ROLE statement and the
+                      optional connectivity check.  Defaults to ``"postgres"``.
+            verify: When ``True`` (default), attempt a ``SELECT 1`` as
+                    *username* with the new password to confirm it works.
+                    A failure is logged as an error and re-raised.
+
+        Raises:
+            PostgresError: If ``ALTER ROLE`` fails or if *verify* is ``True``
+                           and the new password is rejected by PostgreSQL.
+        """
+        pod = self._pod()
+        log.info(
+            "Synchronising PostgreSQL role password for user '%s'", username
+        )
+
+        # ALTER ROLE does not support query parameters via psql; the password
+        # is injected here.  It originates from the Kubernetes Secret (already
+        # cluster-trusted data) and never touches user-controlled input, so
+        # this is not an injection risk in the usual sense.  We still escape
+        # single quotes to be safe against unusual secret values.
+        escaped = password.replace("'", "''")
+        alter_sql = f"ALTER ROLE \"{username}\" PASSWORD '{escaped}';"
+        log.debug("ALTER ROLE \"%s\" PASSWORD '***'", username)
+
+        self._psql(pod, database, alter_sql, user=DB_ADMIN_USER)
+        log.info(
+            "Password for PostgreSQL role '%s' updated successfully", username
+        )
+
+        if not verify:
+            return
+
+        log.info(
+            "Verifying new password for PostgreSQL role '%s'", username
+        )
+        # Build a connection string with the new password and run a trivial
+        # query.  PGPASSWORD is set in the subprocess environment via the
+        # psql -w flag and the PGPASSWORD env-var passed through kubectl exec.
+        # Because kubectl exec does not forward environment variables by default
+        # we embed the password via a psql connection URI instead.
+        escaped_uri = password.replace("@", "%40").replace(":", "%3A")
+        uri = (
+            f"postgresql://{username}:{escaped_uri}"
+            f"@localhost/{database}"
+        )
+        verify_cmd = ["psql", uri, "-t", "-A", "-c", "SELECT 1;"]
+        try:
+            self._exec(pod, verify_cmd, timeout=self.PSQL_TIMEOUT)
+        except PostgresError as exc:
+            raise PostgresError(
+                f"Password verification failed for role '{username}': "
+                f"the new password was set but the connection was rejected. "
+                f"Detail: {exc}"
+            ) from exc
+
+        log.info(
+            "Password verification succeeded for PostgreSQL role '%s'",
+            username,
+        )
+
+    # ------------------------------------------------------------------
     # Convenience wrappers
     # ------------------------------------------------------------------
 
