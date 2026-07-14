@@ -1,1 +1,4 @@
-# No external Python dependencies required for commit 001.
+# PyYAML is required only for the --restore-registry path with an HTTP target
+# registry: it parses and safely merges /etc/rancher/k3s/registries.yaml when
+# configuring the k3s registry mirror (see lib/k3s_registry.py).
+PyYAML>=6.0

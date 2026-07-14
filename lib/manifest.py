@@ -356,6 +356,37 @@ class Manifest:
             "names": sorted(names),
         })
 
+    def set_registry(
+        self,
+        namespace: str,
+        *,
+        manifests: list[str],
+        images: list[dict[str, str]],
+        tool: str,
+    ) -> None:
+        """Populate the optional ``registry`` section.
+
+        This section is written only when a registry backup was requested.
+        It is intentionally **not** part of the required manifest schema, so
+        backups created without a registry remain valid and existing restore
+        logic is unaffected.
+
+        Args:
+            namespace: Kubernetes namespace the registry was backed up from.
+            manifests: Backup-relative paths of the exported manifest files.
+            images: List of ``{"file": <archive path>, "image": <reference>}``
+                    entries describing every saved OCI image archive.
+            tool: Name of the image tool used (``"skopeo"`` or ``"crane"``).
+        """
+        self._require(namespace, "registry.namespace")
+        self._set_section("registry", {
+            "namespace": namespace,
+            "manifests": sorted(manifests),
+            "images": images,
+            "image_count": len(images),
+            "tool": tool,
+        })
+
     # ------------------------------------------------------------------
     # Checksum helpers
     # ------------------------------------------------------------------

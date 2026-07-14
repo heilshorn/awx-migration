@@ -241,8 +241,16 @@ class Kubectl:
         container: Optional[str] = None,
         timeout: int = 120,
         stdin: Optional[str] = None,
+        retries: int = 1,
     ) -> str:
         """Execute a command inside a running pod.
+
+        Commands run via ``exec`` default to ``retries=1`` (no retry) because
+        an in-pod command may mutate state, and blindly re-running a
+        partially-applied mutation can corrupt data (e.g. duplicate rows on a
+        retried restore).  Callers that know their command is idempotent or
+        read-only (a SELECT query, ``rm -f``, ``pg_dump -f`` …) should opt in
+        explicitly by passing ``retries=Kubectl.RETRY_COUNT``.
 
         Args:
             pod: Pod name.
@@ -250,6 +258,8 @@ class Kubectl:
             container: Target container (for multi-container pods).
             timeout: Command timeout in seconds.
             stdin: Optional stdin data.
+            retries: Maximum number of attempts. Defaults to ``1`` (no retry).
+                Set higher only for operations that are safe to repeat.
 
         Returns:
             Command stdout.
@@ -262,7 +272,7 @@ class Kubectl:
             args += ["-c", container]
         args += ["--"] + command
         log.debug("exec %s: %s", pod, " ".join(command))
-        return self.run(args, timeout=timeout, stdin=stdin)
+        return self.run(args, timeout=timeout, stdin=stdin, retries=retries)
 
     def cp_to_pod(
         self,
@@ -541,6 +551,36 @@ class Kubectl:
     # Scaling and rollouts
     # ------------------------------------------------------------------
 
+    def get_replicas(self, resource_type: str, name: str) -> int:
+        """Return the desired replica count (``.spec.replicas``) of a workload.
+
+        Args:
+            resource_type: Resource type, e.g. ``"deployment"``.
+            name: Resource name.
+
+        Returns:
+            The configured replica count.
+
+        Raises:
+            KubectlError: On kubectl failure or if the value is missing or
+                          non-numeric.
+        """
+        out = self.run(
+            [
+                "get", resource_type, name,
+                "-o", "jsonpath={.spec.replicas}",
+            ],
+            timeout=10,
+            retries=1,
+        )
+        try:
+            return int(out.strip())
+        except ValueError as exc:
+            raise KubectlError(
+                f"Unexpected replicas value for {resource_type}/{name}: "
+                f"{out!r}"
+            ) from exc
+
     def scale(
         self,
         resource_type: str,
@@ -724,6 +764,144 @@ class Kubectl:
         )
         log.info("Deployment '%s' rollout complete", name)
 
+    def wait_for_deployment_available(
+        self,
+        name: str,
+        *,
+        timeout: int = 300,
+    ) -> None:
+        """Block until a deployment reports condition ``Available=True``.
+
+        A deployment's ``Available`` condition only becomes True once enough
+        pods have passed their readiness probe (``availableReplicas`` counts
+        Ready pods).  This therefore confirms both that the deployment is
+        available and that its pod is Ready — stronger than merely observing a
+        ``Running`` phase.
+
+        Args:
+            name: Deployment name.
+            timeout: Maximum total wait time in seconds.
+
+        Raises:
+            KubectlError: If the deployment is not Available within *timeout*.
+        """
+        log.info(
+            "Waiting for deployment '%s' to be Available/Ready (timeout=%ds)",
+            name, timeout,
+        )
+        self.run(
+            [
+                "wait",
+                "--for=condition=Available",
+                f"deployment/{name}",
+                f"--timeout={timeout}s",
+            ],
+            timeout=timeout + 15,
+            retries=1,
+        )
+        log.info("Deployment '%s' is Available (pod Ready)", name)
+
+    # ------------------------------------------------------------------
+    # Cluster topology
+    # ------------------------------------------------------------------
+
+    def node_ip(self) -> str:
+        """Return an IP address of a cluster node, usable for NodePort access.
+
+        Prefers an ``ExternalIP`` (routable from outside the cluster) and falls
+        back to an ``InternalIP``.  The first node providing an address wins.
+
+        Returns:
+            A node IP address string.
+
+        Raises:
+            KubectlError: On kubectl failure or if no node address is found.
+        """
+        data = self.json(["get", "nodes", "-o", "json"], namespaced=False)
+        external: Optional[str] = None
+        internal: Optional[str] = None
+        for node in data.get("items", []):
+            for addr in node.get("status", {}).get("addresses", []):
+                addr_type = addr.get("type")
+                if addr_type == "ExternalIP" and external is None:
+                    external = addr.get("address")
+                elif addr_type == "InternalIP" and internal is None:
+                    internal = addr.get("address")
+        ip = external or internal
+        if not ip:
+            raise KubectlError(
+                "Could not determine any node IP address from the cluster"
+            )
+        log.debug(
+            "Resolved node IP '%s' (%s)",
+            ip, "ExternalIP" if external else "InternalIP",
+        )
+        return ip
+
+    def wait_for_nodes_ready(
+        self,
+        *,
+        poll_interval: float = 5.0,
+        timeout: int = 300,
+    ) -> None:
+        """Block until every cluster node reports condition ``Ready=True``.
+
+        Intended for use after a ``systemctl restart k3s``: the API server is
+        briefly unavailable during the restart, so transient kubectl failures
+        (and an empty node list) are tolerated and simply lead to further
+        polling rather than an immediate error.
+
+        Args:
+            poll_interval: Seconds between polling attempts.
+            timeout: Maximum total wait time in seconds.
+
+        Raises:
+            KubectlError: If not all nodes are Ready within *timeout* seconds.
+        """
+        log.info("Waiting for node(s) to become Ready (timeout=%ds)", timeout)
+        deadline = time.monotonic() + timeout
+        last_state = "no response"
+        while True:
+            try:
+                data = self.json(
+                    ["get", "nodes", "-o", "json"],
+                    namespaced=False,
+                    timeout=10,
+                    retries=1,
+                )
+                nodes = data.get("items", [])
+                if nodes and all(self._node_ready(n) for n in nodes):
+                    ready = sum(1 for n in nodes if self._node_ready(n))
+                    log.info("All %d node(s) are Ready", ready)
+                    return
+                total = len(nodes)
+                ready = sum(1 for n in nodes if self._node_ready(n))
+                last_state = f"{ready}/{total} Ready" if total else "no nodes"
+            except KubectlError as exc:
+                # Expected while the API server restarts — keep polling.
+                last_state = f"API unavailable ({exc})"
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise KubectlError(
+                    f"Node(s) did not become Ready within {timeout}s "
+                    f"(last state: {last_state})"
+                )
+            sleep_for = min(poll_interval, remaining)
+            log.debug(
+                "Node(s) not Ready yet (%s); retrying in %.1fs (%.0fs "
+                "remaining)", last_state, sleep_for, remaining,
+            )
+            time.sleep(sleep_for)
+
+    @staticmethod
+    def _node_ready(node: dict[str, Any]) -> bool:
+        """Return True if *node* has a ``Ready`` condition with status ``True``."""
+        for cond in node.get("status", {}).get("conditions", []):
+            if cond.get("type") == "Ready":
+                return cond.get("status") == "True"
+        return False
+
     # ------------------------------------------------------------------
     # Namespace utilities
     # ------------------------------------------------------------------
@@ -748,6 +926,80 @@ class Kubectl:
             return True
         except KubectlError:
             return False
+
+    def create_namespace(self, namespace: Optional[str] = None) -> None:
+        """Create a Kubernetes namespace if it does not already exist.
+
+        A no-op when the namespace is already present, so the call is
+        idempotent.
+
+        Args:
+            namespace: Namespace to create. Defaults to the instance namespace.
+
+        Raises:
+            KubectlError: If the namespace cannot be created.
+        """
+        target = namespace if namespace is not None else self.namespace
+        if self.namespace_exists(target):
+            log.debug("Namespace '%s' already exists", target)
+            return
+        log.info("Creating namespace '%s'", target)
+        self.run(
+            ["create", "namespace", target],
+            namespaced=False,
+            timeout=30,
+            retries=1,
+        )
+        self.wait_for_namespace_active(target)
+
+    def wait_for_namespace_active(
+        self,
+        namespace: Optional[str] = None,
+        *,
+        poll_interval: float = 1.0,
+        timeout: int = 60,
+    ) -> None:
+        """Block until a namespace exists and reports phase ``Active``.
+
+        ``kubectl create namespace`` returns before the namespace object is
+        guaranteed to be observable by subsequent commands; applying resources
+        into it immediately can fail with ``namespaces "<ns>" not found``.
+        This polls the namespace phase (via a non-namespaced kubectl call)
+        until it is ``Active``.
+
+        Args:
+            namespace: Namespace to wait for. Defaults to the instance namespace.
+            poll_interval: Seconds between polling attempts.
+            timeout: Maximum total wait time in seconds.
+
+        Raises:
+            KubectlError: If the namespace is not ``Active`` within *timeout*.
+        """
+        target = namespace if namespace is not None else self.namespace
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                phase = self.run(
+                    [
+                        "get", "namespace", target,
+                        "-o", "jsonpath={.status.phase}",
+                    ],
+                    namespaced=False,
+                    timeout=10,
+                    retries=1,
+                )
+            except KubectlError:
+                phase = ""
+            if phase == "Active":
+                log.debug("Namespace '%s' is Active", target)
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise KubectlError(
+                    f"Namespace '{target}' did not become Active within "
+                    f"{timeout}s (last phase: {phase!r})"
+                )
+            time.sleep(min(poll_interval, remaining))
 
     # ------------------------------------------------------------------
     # Structured output helpers

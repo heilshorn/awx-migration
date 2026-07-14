@@ -24,6 +24,11 @@ from lib.postgres import Postgres, PostgresError
 from lib.secrets import Secrets, SecretError
 from lib.archive import Archive, ArchiveError
 from lib.manifest import Manifest, ManifestError
+from lib.registry_backup import RegistryBackup, RegistryError, RegistryTool
+from lib.registry_rewrite import (
+    RegistryRewriteError,
+    list_execution_environment_images,
+)
 from lib.utils import MigrationError
 
 VERSION = "0.1.0"
@@ -55,6 +60,16 @@ def _parse_args() -> argparse.Namespace:
         "--keep-temp",
         action="store_true",
         help="Keep the temporary backup directory after archiving",
+    )
+    p.add_argument(
+        "--registry-namespace",
+        default=None,
+        metavar="NS",
+        help=(
+            "Also back up the local OCI/Docker registry in this namespace "
+            "(manifests + in-use Execution Environment images). "
+            "Requires 'skopeo' or 'crane'. Omit to skip the registry entirely."
+        ),
     )
     p.add_argument(
         "--verbose",
@@ -185,6 +200,37 @@ def _get_awx_versions(kubectl: Kubectl) -> tuple[str, str]:
     return _get_awx_version(kubectl), _get_operator_version(kubectl)
 
 
+def _backup_registry(
+    kubectl: Kubectl,
+    registry_namespace: str,
+    registry_dir: Path,
+) -> dict[str, object]:
+    """Back up the registry namespace and its in-use images.
+
+    Determines the images actually referenced by the Execution Environments,
+    then exports the registry's manifests and those images via
+    :class:`~lib.registry_backup.RegistryBackup`.
+
+    Args:
+        kubectl: Kubectl instance bound to the AWX namespace (used to read the
+            Execution Environment image list).
+        registry_namespace: Namespace hosting the registry.
+        registry_dir: Destination directory for the registry backup.
+
+    Returns:
+        Summary dict from :meth:`RegistryBackup.export` for the manifest.
+
+    Raises:
+        RegistryError: If no image tool is available or the export fails.
+        RegistryRewriteError: If the EE image list cannot be determined.
+    """
+    tool = RegistryTool.detect()
+    images = list_execution_environment_images(kubectl)
+    registry_kubectl = Kubectl(namespace=registry_namespace)
+    backup = RegistryBackup(registry_kubectl, tool)
+    return backup.export(registry_dir, images)
+
+
 def main() -> None:
     """Orchestrate the complete AWX backup workflow."""
     args = _parse_args()
@@ -224,6 +270,18 @@ def main() -> None:
         log.info("Exporting Secrets...")
         exported_secrets = sec.export_all(secrets_dir)
 
+        # Step 2b — Optional registry backup (only when a namespace is given).
+        # Placed before manifest/checksums so the registry files are covered
+        # by the archive checksums like any other backup content.
+        registry_summary: dict[str, object] | None = None
+        if args.registry_namespace:
+            log.info(
+                "Backing up registry namespace '%s'...", args.registry_namespace
+            )
+            registry_summary = _backup_registry(
+                kubectl, args.registry_namespace, tmp_dir / "registry"
+            )
+
         # Step 3 — Cluster metadata (best-effort)
         pg_version = pg.version()
         db_size_row = pg.query_one(
@@ -251,6 +309,13 @@ def main() -> None:
             size=dump_size,
         )
         mf.set_secrets(names=exported_secrets)
+        if registry_summary is not None:
+            mf.set_registry(
+                namespace=str(registry_summary["namespace"]),
+                manifests=list(registry_summary["manifests"]),  # type: ignore[arg-type]
+                images=list(registry_summary["images"]),  # type: ignore[arg-type]
+                tool=str(registry_summary["tool"]),
+            )
 
         # Step 5 — Checksums of data files (manifest.json not yet written,
         #           so there is no self-referential checksum entry)
@@ -284,6 +349,8 @@ def main() -> None:
         SecretError,
         ArchiveError,
         ManifestError,
+        RegistryError,
+        RegistryRewriteError,
         MigrationError,
     ) as exc:
         log.error("Backup failed: %s", exc)

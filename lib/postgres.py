@@ -60,6 +60,11 @@ class Postgres:
     MAINT_TIMEOUT: int = 300
     DUMP_TIMEOUT: int = 3600
 
+    #: Retry count for operations that are safe to repeat (read-only queries
+    #: and idempotent commands such as ``pg_dump -f``).  Mutating commands run
+    #: with the default of a single attempt and must not use this.
+    SAFE_RETRIES: int = Kubectl.RETRY_COUNT
+
     def __init__(self, kubectl: Kubectl) -> None:
         """Initialise with a configured Kubectl instance.
 
@@ -100,6 +105,7 @@ class Postgres:
         command: list[str],
         *,
         timeout: int = PSQL_TIMEOUT,
+        retries: int = 1,
     ) -> str:
         """Execute *command* inside *pod* and return stripped stdout.
 
@@ -109,6 +115,9 @@ class Postgres:
             pod: PostgreSQL pod name.
             command: Command with arguments.
             timeout: Timeout in seconds.
+            retries: Maximum number of attempts. Defaults to ``1`` (no retry),
+                the safe choice for mutating commands. Pass
+                :data:`SAFE_RETRIES` for read-only or idempotent commands.
 
         Returns:
             Stripped stdout string.
@@ -117,7 +126,9 @@ class Postgres:
             PostgresError: On execution failure.
         """
         try:
-            return self._kubectl.exec(pod, command, timeout=timeout)
+            return self._kubectl.exec(
+                pod, command, timeout=timeout, retries=retries
+            )
         except KubectlError as exc:
             if any(m in str(exc).lower() for m in _POD_GONE_MARKERS):
                 self._invalidate_pod_cache()
@@ -133,6 +144,7 @@ class Postgres:
         *,
         user: str = DB_USER,
         timeout: int = PSQL_TIMEOUT,
+        retries: int = 1,
     ) -> str:
         """Run *sql* via psql with ``-t -A`` and return raw stripped stdout.
 
@@ -144,6 +156,8 @@ class Postgres:
             sql: SQL statement.
             user: PostgreSQL role. Defaults to :data:`DB_USER`.
             timeout: Timeout in seconds.
+            retries: Maximum attempts. Defaults to ``1``; read-only callers
+                may pass :data:`SAFE_RETRIES`.
 
         Returns:
             Stripped psql output.
@@ -156,7 +170,7 @@ class Postgres:
             "-t", "-A", "-c", sql,
         ]
         log.debug("psql -U %s -d %s -c %r", user, database, sql)
-        return self._exec(pod, cmd, timeout=timeout)
+        return self._exec(pod, cmd, timeout=timeout, retries=retries)
 
     def _psql_rows(
         self,
@@ -166,6 +180,7 @@ class Postgres:
         *,
         user: str = DB_USER,
         timeout: int = PSQL_TIMEOUT,
+        retries: int = 1,
     ) -> list[dict[str, str]]:
         """Run *sql* via psql with ``--csv`` and return rows as dicts.
 
@@ -175,6 +190,8 @@ class Postgres:
             sql: SQL SELECT statement.
             user: PostgreSQL role. Defaults to :data:`DB_USER`.
             timeout: Timeout in seconds.
+            retries: Maximum attempts. Defaults to ``1``; read-only callers
+                may pass :data:`SAFE_RETRIES`.
 
         Returns:
             List of row dicts keyed by column name.
@@ -187,7 +204,7 @@ class Postgres:
             "--csv", "-c", sql,
         ]
         log.debug("psql -U %s --csv -d %s -c %r", user, database, sql)
-        output = self._exec(pod, cmd, timeout=timeout)
+        output = self._exec(pod, cmd, timeout=timeout, retries=retries)
         try:
             reader = csv.DictReader(io.StringIO(output))
             return [dict(row) for row in reader]
@@ -221,7 +238,9 @@ class Postgres:
             PostgresError: On failure.
         """
         pod = self._pod()
-        return self._psql(pod, "postgres", "SHOW server_version;")
+        return self._psql(
+            pod, "postgres", "SHOW server_version;", retries=self.SAFE_RETRIES
+        )
 
     def database_exists(self, name: str) -> bool:
         """Return True if a database with *name* exists.
@@ -237,7 +256,9 @@ class Postgres:
         """
         pod = self._pod()
         sql = f"SELECT 1 FROM pg_database WHERE datname = '{name}';"
-        return self._psql(pod, "postgres", sql).strip() == "1"
+        return self._psql(
+            pod, "postgres", sql, retries=self.SAFE_RETRIES
+        ).strip() == "1"
 
     def database_size(self, name: str) -> str:
         """Return the human-readable on-disk size of database *name*.
@@ -253,7 +274,7 @@ class Postgres:
         """
         pod = self._pod()
         sql = f"SELECT pg_size_pretty(pg_database_size('{name}'));"
-        return self._psql(pod, "postgres", sql)
+        return self._psql(pod, "postgres", sql, retries=self.SAFE_RETRIES)
 
     def active_connections(self, database: str) -> int:
         """Return the number of active connections to *database*.
@@ -275,7 +296,10 @@ class Postgres:
             f"SELECT count(*) FROM pg_stat_activity "
             f"WHERE datname = '{database}';"
         )
-        raw = self._psql(pod, "postgres", sql, user=DB_ADMIN_USER)
+        raw = self._psql(
+            pod, "postgres", sql,
+            user=DB_ADMIN_USER, retries=self.SAFE_RETRIES,
+        )
         try:
             return int(raw.strip())
         except ValueError as exc:
@@ -321,6 +345,13 @@ class Postgres:
         Automatically calls :meth:`terminate_connections` before dropping
         so the caller does not need to handle this explicitly.
 
+        The drop uses ``WITH (FORCE)`` (PostgreSQL 13+), which atomically
+        terminates any remaining backend still attached to the database and
+        then drops it.  This guards against a stray session that reconnected
+        in the brief window after :meth:`terminate_connections` — the AWX
+        deployments should already be scaled to zero by the caller, but
+        ``WITH (FORCE)`` is a cheap second line of defence.
+
         Args:
             database: Database name.
 
@@ -333,7 +364,7 @@ class Postgres:
         self._psql(
             pod,
             "postgres",
-            f'DROP DATABASE IF EXISTS "{database}";',
+            f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE);',
             user=DB_ADMIN_USER,
         )
 
@@ -377,7 +408,7 @@ class Postgres:
             "SELECT tablename FROM pg_tables "
             "WHERE schemaname = 'public' ORDER BY tablename;"
         )
-        rows = self._psql_rows(pod, database, sql)
+        rows = self._psql_rows(pod, database, sql, retries=self.SAFE_RETRIES)
         return [r["tablename"] for r in rows]
 
     def table_count(self, database: str) -> int:
@@ -396,7 +427,7 @@ class Postgres:
         sql = (
             "SELECT count(*) FROM pg_tables WHERE schemaname = 'public';"
         )
-        raw = self._psql(pod, database, sql)
+        raw = self._psql(pod, database, sql, retries=self.SAFE_RETRIES)
         try:
             return int(raw.strip())
         except ValueError as exc:
@@ -422,7 +453,7 @@ class Postgres:
             PostgresError: On execution or parse failure.
         """
         pod = self._pod()
-        return self._psql_rows(pod, database, sql)
+        return self._psql_rows(pod, database, sql, retries=self.SAFE_RETRIES)
 
     def query_one(
         self, database: str, sql: str
@@ -518,6 +549,8 @@ class Postgres:
         log.info("Creating PostgreSQL dump of database '%s'...", database)
         log.debug("pg_dump -U %s -Fc -d %s -f %s", DB_USER, database, remote)
         try:
+            # pg_dump writes to a fresh temp file (-f overwrites), so a retry
+            # after a transient failure is safe to repeat.
             self._exec(
                 pod,
                 [
@@ -525,6 +558,7 @@ class Postgres:
                     "-d", database, "-f", remote,
                 ],
                 timeout=self.DUMP_TIMEOUT,
+                retries=self.SAFE_RETRIES,
             )
             log.info("Transferring dump to '%s'...", outfile)
             try:
@@ -545,8 +579,23 @@ class Postgres:
         ``kubectl cp`` and then restored with ``pg_restore``.  The dump data
         never passes through Python process memory.
 
-        Restore aborts on the first error (``--exit-on-error``).
-        The target database must already exist.
+        The restore runs inside a single transaction (``--single-transaction``)
+        so it is atomic: on any error the entire restore is rolled back,
+        leaving the freshly-created database empty rather than partially
+        populated.  This is critical because pg_restore is **not idempotent** —
+        a partially-committed restore followed by a second attempt would
+        duplicate rows (violating primary keys) and corrupt referential
+        integrity.  For the same reason the command is executed with
+        ``retries=1``; it must never be re-run against a partial result.
+
+        ``--single-transaction`` implies ``--exit-on-error`` and aborts on the
+        first failure.  ``--clean`` is intentionally **not** used: the caller
+        (:meth:`restore_database`) drops and recreates the database first, so
+        the target is already empty, and ``--clean`` would additionally fail on
+        AWX's partitioned event tables (a partition's local index cannot be
+        dropped while the parent partitioned index depends on it).
+
+        The target database must already exist and be empty.
 
         Args:
             database: Target database name.
@@ -573,12 +622,12 @@ class Postgres:
                 [
                     "pg_restore", "-U", DB_USER,
                     "-d", database,
-                    "--clean", "--if-exists",
                     "--no-owner", "--no-privileges",
-                    "--exit-on-error",
+                    "--single-transaction",
                     remote,
                 ],
                 timeout=self.DUMP_TIMEOUT,
+                retries=1,
             )
         finally:
             self._remove_pod_file(pod, remote)
