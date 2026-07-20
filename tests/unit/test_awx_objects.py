@@ -156,3 +156,40 @@ def test_relation_dataclass_defaults() -> None:
     """Relation.many defaults to False."""
     rel = Relation("organization", "organizations")
     assert rel.many is False
+
+
+def test_awx_type_defaults_to_key_but_can_override() -> None:
+    """awx_type falls back to key, except where AWX uses a different name."""
+    assert OBJECT_TYPES["job_templates"].awx_type == "job_templates"
+    assert OBJECT_TYPES["organizations"].awx_type == "organizations"
+    # Inventories are the singular exception in awxkit.
+    assert OBJECT_TYPES["inventories"].awx_type == "inventory"
+
+
+def test_awx_type_name_is_the_singular_natural_key_type() -> None:
+    """Each registered type declares its singular AWX natural-key type."""
+    assert OBJECT_TYPES["organizations"].awx_type_name == "organization"
+    assert OBJECT_TYPES["projects"].awx_type_name == "project"
+    assert OBJECT_TYPES["inventories"].awx_type_name == "inventory"
+    assert OBJECT_TYPES["job_templates"].awx_type_name == "job_template"
+
+
+def test_identity_prefers_natural_key_metadata() -> None:
+    """When natural_key metadata is present it is the identity source."""
+    jt = OBJECT_TYPES["job_templates"]
+    # Body carries no organization (as with a real job-template export); the
+    # identity still resolves via the natural_key metadata.
+    obj = CanonicalObject(
+        "job_templates",
+        {"name": "Deploy"},
+        natural_key={"name": "Deploy", "organization": "Default"},
+    )
+    assert obj.identity(jt.natural_key) == ("Deploy", "Default")
+
+
+def test_identity_falls_back_to_fields_without_metadata() -> None:
+    """Without natural_key metadata, identity is read from the fields."""
+    obj = CanonicalObject(
+        "job_templates", {"name": "Deploy", "organization": "Default"}
+    )
+    assert obj.identity(("name", "organization")) == ("Deploy", "Default")

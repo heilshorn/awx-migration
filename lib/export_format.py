@@ -140,6 +140,7 @@ def write_type_file(
             the file cannot be written.
     """
     payload: list[dict[str, Any]] = []
+    natural_keys: list[dict[str, Any] | None] = []
     for obj in objects:
         if obj.type != object_type:
             raise ExportFormatError(
@@ -147,6 +148,7 @@ def write_type_file(
                 f"{object_type!r} type file"
             )
         payload.append(obj.fields)
+        natural_keys.append(obj.natural_key)
 
     document: dict[str, Any] = {
         "format_version": FORMAT_VERSION,
@@ -160,6 +162,10 @@ def write_type_file(
         "count": len(payload),
         "objects": payload,
     }
+    # Identity metadata is kept in a parallel array, separate from the business
+    # fields, and only when at least one object carries it.
+    if any(nk is not None for nk in natural_keys):
+        document["natural_keys"] = natural_keys
     _write_json(Path(path), document)
 
 
@@ -201,14 +207,29 @@ def read_type_file(path: str | Path) -> TypeFile:
             f"Type file '{path}' is missing an 'objects' list"
         )
 
+    raw_natural_keys = doc.get("natural_keys")
+    natural_keys = (
+        raw_natural_keys if isinstance(raw_natural_keys, list) else []
+    )
+
     objects: list[CanonicalObject] = []
-    for entry in raw_objects:
+    for index, entry in enumerate(raw_objects):
         if not isinstance(entry, dict):
             raise ExportFormatError(
                 f"Type file '{path}' contains a non-object entry: "
                 f"{type(entry).__name__}"
             )
-        objects.append(CanonicalObject(type=object_type, fields=entry))
+        natural_key = (
+            natural_keys[index]
+            if index < len(natural_keys)
+            and isinstance(natural_keys[index], dict)
+            else None
+        )
+        objects.append(
+            CanonicalObject(
+                type=object_type, fields=entry, natural_key=natural_key
+            )
+        )
 
     metadata = {
         k: v
@@ -220,6 +241,7 @@ def read_type_file(path: str | Path) -> TypeFile:
             "kind",
             "object_type",
             "objects",
+            "natural_keys",
         }
     }
     return TypeFile(

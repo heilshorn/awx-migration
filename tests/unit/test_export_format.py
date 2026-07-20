@@ -56,6 +56,46 @@ def test_type_file_roundtrip(tmp_path: Path) -> None:
     assert result.objects == objects
 
 
+def test_type_file_persists_natural_key_as_separate_metadata(
+    tmp_path: Path,
+) -> None:
+    """natural_key round-trips in a parallel array, separate from fields."""
+    path = tmp_path / "inventories.json"
+    objects = [
+        CanonicalObject(
+            "inventories",
+            {"name": "Demo", "organization": "Default"},
+            natural_key={"name": "Demo", "organization": "Default"},
+        )
+    ]
+    write_type_file(path, "inventories", objects, **_META)
+
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert raw["natural_keys"] == [{"name": "Demo", "organization": "Default"}]
+    # Identity metadata is kept out of the business-field objects.
+    assert "natural_key" not in raw["objects"][0]
+
+    result = read_type_file(path)
+    assert result.objects == objects
+    assert result.objects[0].natural_key == {
+        "name": "Demo",
+        "organization": "Default",
+    }
+
+
+def test_type_file_omits_natural_keys_when_absent(tmp_path: Path) -> None:
+    """No parallel array is written when no object carries identity metadata."""
+    path = tmp_path / "organizations.json"
+    write_type_file(
+        path,
+        "organizations",
+        [CanonicalObject("organizations", {"name": "Default"})],
+        **_META,
+    )
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert "natural_keys" not in raw
+
+
 def test_type_file_envelope_fields(tmp_path: Path) -> None:
     """The written envelope carries both version numbers and the kind."""
     path = tmp_path / "organizations.json"

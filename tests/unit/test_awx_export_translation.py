@@ -44,7 +44,11 @@ def _client(output: str, object_types=OBJECT_TYPES) -> AwxCliClient:
 
 
 def _jt_export(**overrides: Any) -> str:
-    """One job_templates export document with a fully-populated raw object."""
+    """One job_templates export document with a realistic awxkit raw object.
+
+    Mirrors ``awx export --job_templates``: no top-level ``organization`` (it
+    lives only in ``natural_key``), references are nested natural keys.
+    """
     obj: dict[str, Any] = {
         "id": 42,
         "url": "/api/v2/job_templates/42/",
@@ -56,11 +60,23 @@ def _jt_export(**overrides: Any) -> str:
         "name": "Deploy",
         "description": "deploy things",
         "job_type": "run",
-        "organization": {"name": "Default"},
-        "inventory": {"name": "Linux"},
-        "project": "Infra",
+        "inventory": {
+            "name": "Linux",
+            "organization": {"name": "Default", "type": "organization"},
+            "type": "inventory",
+        },
+        "project": {
+            "name": "Infra",
+            "organization": {"name": "Default", "type": "organization"},
+            "type": "project",
+        },
         "playbook": "deploy.yml",
         "secret_field": "should-not-appear",
+        "natural_key": {
+            "name": "Deploy",
+            "organization": {"name": "Default", "type": "organization"},
+            "type": "job_template",
+        },
     }
     obj.update(overrides)
     return json.dumps({"job_templates": [obj]})
@@ -107,9 +123,54 @@ def test_missing_whitelisted_field_is_absent() -> None:
 def test_references_become_natural_keys() -> None:
     client = _client(_jt_export())
     obj = client.export("job_templates")[0]
-    assert obj.fields["organization"] == "Default"
-    assert obj.fields["inventory"] == "Linux"
-    assert obj.fields["project"] == "Infra"  # already a bare name string
+    # Reference to a non-org-scoped type collapses to a bare name; references
+    # to org-scoped types keep {name, organization} (names only, no AWX type).
+    assert obj.fields["inventory"] == {"name": "Linux", "organization": "Default"}
+    assert obj.fields["project"] == {"name": "Infra", "organization": "Default"}
+    # Job templates carry no top-level organization; identity comes from the
+    # natural_key metadata instead.
+    assert obj.natural_key == {"name": "Deploy", "organization": "Default"}
+
+
+def test_natural_key_metadata_is_separate_from_fields() -> None:
+    obj = _client(_jt_export()).export("job_templates")[0]
+    assert obj.natural_key == {"name": "Deploy", "organization": "Default"}
+    assert "natural_key" not in obj.fields
+
+
+def test_job_template_org_filter_uses_natural_key_metadata() -> None:
+    # Job templates carry no top-level organization; org filtering must fall
+    # back to the natural_key metadata.
+    doc = json.dumps(
+        {
+            "job_templates": [
+                {
+                    "name": "A",
+                    "natural_key": {
+                        "name": "A",
+                        "organization": {
+                            "name": "Default",
+                            "type": "organization",
+                        },
+                        "type": "job_template",
+                    },
+                },
+                {
+                    "name": "B",
+                    "natural_key": {
+                        "name": "B",
+                        "organization": {
+                            "name": "Other",
+                            "type": "organization",
+                        },
+                        "type": "job_template",
+                    },
+                },
+            ]
+        }
+    )
+    objs = _client(doc).export("job_templates", organization="Default")
+    assert [o.fields["name"] for o in objs] == ["A"]
 
 
 def test_reference_id_is_never_emitted() -> None:
@@ -204,3 +265,27 @@ def test_unexpected_shape_raises() -> None:
 
 def test_empty_export_returns_empty_list() -> None:
     assert _client('{"job_templates": []}').export("job_templates") == []
+
+
+# -- AWX asset-type key mapping ---------------------------------------
+
+
+def test_inventory_export_reads_awx_singular_key() -> None:
+    # awxkit keys inventories in the singular ("inventory"), not "inventories".
+    doc = json.dumps(
+        {
+            "inventory": [
+                {"name": "Demo", "organization": {"name": "Default"}}
+            ]
+        }
+    )
+    objs = _client(doc).export("inventories")
+    assert [o.fields["name"] for o in objs] == ["Demo"]
+    assert objs[0].fields["organization"] == "Default"
+
+
+def test_inventory_export_falls_back_to_registry_key() -> None:
+    # Robustness: a payload keyed by the plural registry key still parses.
+    doc = json.dumps({"inventories": [{"name": "Demo"}]})
+    objs = _client(doc).export("inventories")
+    assert [o.fields["name"] for o in objs] == ["Demo"]

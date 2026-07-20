@@ -75,6 +75,21 @@ def test_run_returns_stripped_stdout(
     assert captured["kwargs"]["env"]["TOWER_HOST"] == "h"
 
 
+def test_run_strips_ansi_colour_codes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Some awx builds wrap JSON output in ANSI colour codes even off a TTY;
+    # the wrapper must return clean, parseable text.
+    coloured = '\x1b[32m{\n  "id": 21,\n  "name": "Demo"\n}\x1b[0m'
+
+    def fake_run(cmd, **kwargs):  # type: ignore[no-untyped-def]
+        return _Result(0, stdout=coloured)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    out = AwxCli("/usr/bin/awx").run(["organizations", "create"])
+    assert out == '{\n  "id": 21,\n  "name": "Demo"\n}'
+
+
 def test_run_passes_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, Any] = {}
 

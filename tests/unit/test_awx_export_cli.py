@@ -69,19 +69,14 @@ def cli(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         export_error=None,
     )
 
-    monkeypatch.setattr(
-        awx_export, "Kubectl", lambda namespace=None: SimpleNamespace(namespace=namespace)
-    )
-
-    def fake_resolve(kubectl, args):  # type: ignore[no-untyped-def]
+    def fake_build_connection(args):  # type: ignore[no-untyped-def]
         if state.connection_error is not None:
             raise state.connection_error
-        return SimpleNamespace(host="https://awx.example")
+        kubectl = SimpleNamespace(namespace=getattr(args, "namespace", None))
+        connection = SimpleNamespace(host="https://awx.example")
+        return kubectl, connection, state.client
 
-    monkeypatch.setattr(awx_export, "resolve_connection", fake_resolve)
-    monkeypatch.setattr(
-        awx_export, "make_client", lambda connection, *a, **k: state.client
-    )
+    monkeypatch.setattr(awx_export, "build_connection", fake_build_connection)
 
     def make_exporter(client, object_types, **kwargs):  # type: ignore[no-untyped-def]
         exporter = _RecordingExporter(client, object_types, **kwargs)

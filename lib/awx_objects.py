@@ -52,6 +52,14 @@ class ObjectType:
         fields: Whitelist of canonical fields exported for this type.  Only
             listed fields are ever written; new internal AWX fields can never
             leak into an export.
+        awx_key: AWX asset-type key used in ``awx export`` output and
+            ``awx import`` input, when it differs from :attr:`key`.  awxkit
+            keys most assets in the plural (matching :attr:`key`) but a few in
+            the singular (e.g. inventories are keyed ``"inventory"``).  ``None``
+            means "same as :attr:`key`"; read it through :attr:`awx_type`.
+        awx_type_name: Singular ``type`` value AWX uses inside natural keys for
+            this object (e.g. ``"job_template"`` for ``job_templates``).  The
+            reference adapter needs it to build AWX natural keys on import.
         relations: Reference fields and their target types.
         depends_on: Registry keys that must be imported before this type.
         validator: Optional ``(CanonicalObject) -> list[str]`` hook returning
@@ -70,6 +78,8 @@ class ObjectType:
     natural_key: tuple[str, ...]
     org_scoped: bool
     fields: tuple[str, ...]
+    awx_key: str | None = None
+    awx_type_name: str | None = None
     relations: tuple[Relation, ...] = ()
     depends_on: tuple[str, ...] = ()
     validator: Callable[..., Any] | None = None
@@ -77,6 +87,16 @@ class ObjectType:
     importer: Callable[..., Any] | None = None
     post_export: Callable[..., Any] | None = None
     post_import: Callable[..., Any] | None = None
+
+    @property
+    def awx_type(self) -> str:
+        """AWX asset-type key for this type, falling back to :attr:`key`.
+
+        This is the key AWX uses inside ``awx export`` output and the
+        ``awx import`` bundle — usually identical to :attr:`key`, but singular
+        for a few asset types (see :attr:`awx_key`).
+        """
+        return self.awx_key or self.key
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +111,7 @@ OBJECT_TYPES: dict[str, ObjectType] = {
         natural_key=("name",),
         org_scoped=False,
         fields=("name", "description", "max_hosts"),
+        awx_type_name="organization",
     ),
     "projects": ObjectType(
         key="projects",
@@ -109,12 +130,15 @@ OBJECT_TYPES: dict[str, ObjectType] = {
             "scm_delete_on_update",
             "scm_update_on_launch",
         ),
+        awx_type_name="project",
         relations=(Relation("organization", "organizations"),),
         depends_on=("organizations",),
     ),
     "inventories": ObjectType(
         key="inventories",
-        cli_flag="--inventories",
+        # awxkit's export/import resource is the singular "inventory"; the
+        # plural flag is silently ignored and would dump the whole database.
+        cli_flag="--inventory",
         filename="inventories.json",
         natural_key=("name", "organization"),
         org_scoped=True,
@@ -125,6 +149,10 @@ OBJECT_TYPES: dict[str, ObjectType] = {
             "kind",
             "variables",
         ),
+        # awxkit keys inventories in the singular ("inventory") in both
+        # `awx export` output and the `awx import` bundle.
+        awx_key="inventory",
+        awx_type_name="inventory",
         relations=(Relation("organization", "organizations"),),
         depends_on=("organizations",),
     ),
@@ -150,6 +178,7 @@ OBJECT_TYPES: dict[str, ObjectType] = {
             "skip_tags",
             "ask_variables_on_launch",
         ),
+        awx_type_name="job_template",
         relations=(
             Relation("organization", "organizations"),
             Relation("inventory", "inventories"),

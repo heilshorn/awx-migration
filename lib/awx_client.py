@@ -10,24 +10,32 @@ Two implementations are foreseen:
 * :class:`AwxCliClient` — drives the ``awx`` command-line binary (this phase).
 * ``AwxRestClient`` — a future REST-API implementation (not present yet).
 
-In this phase only the infrastructure is implemented: construction, the AWX
-environment for the CLI, and :meth:`AwxCliClient.list_organizations`.  The
-translation-heavy methods (:meth:`export`, :meth:`import_objects`,
-:meth:`exists`) intentionally raise :class:`NotImplementedError`.
+This module owns both translation directions: AWX → canonical (export) and
+canonical → AWX (import).  No other layer parses or produces native AWX JSON.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from .awx_cli import AwxCli
+from .awx_cli import AwxCli, AwxCliError
 from .awx_connection import AwxConnection
 from .awx_objects import OBJECT_TYPES, ObjectType
 from .canonical import CanonicalObject
+
+log: logging.Logger = logging.getLogger("awx-migration")
+
+#: Conflict policies accepted by :meth:`AwxCliClient.import_objects`.
+_CONFLICT_POLICIES: tuple[str, ...] = ("update", "skip", "fail")
+
+#: AWX ``type`` value of an organization inside a natural key.  Org-scoped
+#: references nest their organization under this type.
+_ORGANIZATION_TYPE: str = "organization"
 
 
 class AwxClientError(RuntimeError):
@@ -99,44 +107,113 @@ class AwxClient(ABC):
         """
 
 
-def _reference_name(value: Any) -> str | None:
-    """Reduce a single AWX reference to a natural-key name.
+# ---------------------------------------------------------------------------
+# Reference adapter — AWX natural keys ⇄ canonical references.
+#
+# The canonical form is deliberately AWX-agnostic: a reference to a
+# non-org-scoped type is a plain name string; a reference to an org-scoped type
+# is ``{"name": …, "organization": …}`` (names only, no AWX ``type`` and no
+# nested AWX dicts).  This adapter is the single place that knows AWX's
+# natural-key shape.
+# ---------------------------------------------------------------------------
 
-    AWX ``export`` represents a related object either as a natural-key object
-    (``{"name": "Linux", ...}``) or as a bare name string.  A raw integer ID is
-    deliberately dropped (references are never stored as IDs); an unresolvable
-    reference becomes ``None``.
 
-    Args:
-        value: The raw reference value from an AWX object.
+def _split_name_org(value: Any) -> tuple[str | None, str | None]:
+    """Extract ``(name, organization_name)`` from an AWX or canonical reference.
 
-    Returns:
-        The referenced object's name, or ``None`` if it cannot be determined.
+    Accepts a bare name string, an AWX natural-key dict (``{"name": …,
+    "organization": {"name": …}, "type": …}``), or a canonical org-scoped
+    reference (``{"name": …, "organization": …}``).  A raw integer ID or any
+    other shape yields ``(None, None)`` — references are never IDs.
     """
     if isinstance(value, str):
-        return value
+        return value, None
+    if isinstance(value, Mapping):
+        name = value.get("name")
+        name = name if isinstance(name, str) else None
+        org = value.get("organization")
+        if isinstance(org, Mapping):
+            org = org.get("name")
+        org = org if isinstance(org, str) else None
+        return name, org
+    return None, None
+
+
+def _ref_to_canonical(value: Any, target: "ObjectType | None") -> Any:
+    """Reduce one AWX reference to its canonical form.
+
+    Args:
+        value: The raw AWX reference value.
+        target: The referenced object's :class:`ObjectType`, or ``None`` when
+            unknown.
+
+    Returns:
+        A plain name for a reference to a non-org-scoped type, a
+        ``{"name": …, "organization": …}`` mapping for an org-scoped one, or
+        ``None`` when the reference cannot be resolved to a name.
+    """
+    name, org = _split_name_org(value)
+    if name is None:
+        return None
+    if target is not None and target.org_scoped:
+        return {"name": name, "organization": org}
+    return name
+
+
+def _ref_to_awx(value: Any, target: "ObjectType | None") -> Any:
+    """Build one AWX-import natural key from a canonical reference.
+
+    The inverse of :func:`_ref_to_canonical`.  Produces the natural-key dict
+    ``awx import`` expects — always carrying ``type``, and nesting the
+    organization for org-scoped targets — or ``None`` when the reference has no
+    usable name (so the caller can omit the field).
+    """
+    name, org = _split_name_org(value)
+    if name is None:
+        return None
+    type_name = target.awx_type_name if target is not None else None
+    ref: dict[str, Any] = {"type": type_name, "name": name}
+    if target is not None and target.org_scoped and org is not None:
+        ref["organization"] = {"type": _ORGANIZATION_TYPE, "name": org}
+    return ref
+
+
+def _object_organization(obj: CanonicalObject) -> str | None:
+    """Return an object's organization name for org-scoped filtering.
+
+    Prefers the identity metadata (:attr:`CanonicalObject.natural_key`), which
+    is populated even for objects that carry no top-level ``organization``
+    field (e.g. job templates); falls back to the ``organization`` field.
+    """
+    if obj.natural_key is not None and "organization" in obj.natural_key:
+        return obj.natural_key.get("organization")
+    value = obj.fields.get("organization")
     if isinstance(value, Mapping):
         name = value.get("name")
         return name if isinstance(name, str) else None
-    return None
+    return value if isinstance(value, str) else None
 
 
-def _reference_value(value: Any, *, many: bool) -> Any:
-    """Translate a relation value to a natural key, or a list of them.
+def _natural_key_to_canonical(raw: Any) -> dict[str, Any] | None:
+    """Reduce AWX's ``natural_key`` to AWX-agnostic identity metadata.
 
-    Args:
-        value: The raw relation value.
-        many: ``True`` when the relation holds a list of references.
-
-    Returns:
-        A single name (or ``None``) for a to-one relation, or a list of names
-        for a to-many relation.
+    Drops the ``type`` markers and flattens any nested natural key (e.g. the
+    organization) down to its name, yielding e.g.
+    ``{"name": "Deploy", "organization": "Default"}``.  Returns ``None`` when
+    there is no usable natural key.
     """
-    if many:
-        if not isinstance(value, (list, tuple)):
-            return []
-        return [_reference_name(item) for item in value]
-    return _reference_name(value)
+    if not isinstance(raw, Mapping):
+        return None
+    clean: dict[str, Any] = {}
+    for key, value in raw.items():
+        if key == "type":
+            continue
+        if isinstance(value, Mapping):
+            name = value.get("name")
+            clean[key] = name if isinstance(name, str) else None
+        else:
+            clean[key] = value
+    return clean or None
 
 
 class AwxCliClient(AwxClient):
@@ -275,7 +352,7 @@ class AwxCliClient(AwxClient):
             canonical = [
                 obj
                 for obj in canonical
-                if obj.fields.get("organization") == organization
+                if _object_organization(obj) == organization
             ]
         return canonical
 
@@ -296,7 +373,14 @@ class AwxCliClient(AwxClient):
             ) from exc
 
         if isinstance(data, Mapping):
-            items = data.get(obj_type.key, [])
+            # AWX keys the list by its asset-type name, which is usually the
+            # registry key but singular for some types (e.g. "inventory").
+            # Try the AWX key first, then the registry key as a fallback.
+            items = []
+            for candidate in (obj_type.awx_type, obj_type.key):
+                if candidate in data:
+                    items = data[candidate]
+                    break
         elif isinstance(data, list):
             items = data
         else:
@@ -325,9 +409,11 @@ class AwxCliClient(AwxClient):
     ) -> CanonicalObject:
         """Translate one raw AWX object into a canonical object.
 
-        Only whitelisted fields are copied; relations are reduced to natural
-        keys.  Any field not in the whitelist (``id``, ``url``, timestamps,
-        ``summary_fields`` …) is dropped.
+        Only whitelisted fields are copied; relations are reduced to their
+        canonical reference form.  Any field not in the whitelist (``id``,
+        ``url``, timestamps, ``summary_fields`` …) is dropped.  AWX's
+        ``natural_key`` is captured separately as identity metadata, not as a
+        business field.
         """
         relations = {rel.field: rel for rel in obj_type.relations}
         fields: dict[str, Any] = {}
@@ -337,28 +423,181 @@ class AwxCliClient(AwxClient):
             value = raw[field_name]
             rel = relations.get(field_name)
             if rel is not None:
-                fields[field_name] = _reference_value(value, many=rel.many)
+                target = self._object_types.get(rel.target_type)
+                if rel.many:
+                    items = value if isinstance(value, (list, tuple)) else []
+                    fields[field_name] = [
+                        _ref_to_canonical(item, target) for item in items
+                    ]
+                else:
+                    fields[field_name] = _ref_to_canonical(value, target)
             else:
                 fields[field_name] = value
-        return CanonicalObject(type=obj_type.key, fields=fields)
+        natural_key = _natural_key_to_canonical(raw.get("natural_key"))
+        return CanonicalObject(
+            type=obj_type.key, fields=fields, natural_key=natural_key
+        )
 
     def import_objects(
         self,
         object_type: str,
         objects: Sequence[CanonicalObject],
         *,
-        on_conflict: str,
+        on_conflict: str = "update",
     ) -> ImportResult:
-        """Not implemented in this phase."""
-        raise NotImplementedError(
-            "AwxCliClient.import_objects is implemented in a later phase"
-        )
+        """Import canonical *objects* of *object_type* into AWX.
+
+        Translates each canonical object into its native AWX asset form
+        (whitelist fields only, references as natural keys, never IDs), wraps
+        them in an ``awx import`` bundle (``{object_type: [assets]}``), and
+        pipes that JSON to ``awx import``.
+
+        Conflict handling: the *on_conflict* policy is validated and threaded
+        through, but the actual skip/fail mechanism is deferred to a later
+        phase.  ``update`` (the default) relies on ``awx import``'s native
+        upsert.  For ``skip``/``fail`` a warning notes that enforcement is not
+        yet active.  Per-object created/updated attribution is likewise
+        deferred; a successful bulk import reports no per-object breakdown yet
+        (the object count is tracked by the importer).
+
+        Args:
+            object_type: Registry key of the type being imported.
+            objects: Canonical objects to import.
+            on_conflict: One of ``"update"``, ``"skip"``, ``"fail"``.
+
+        Returns:
+            An :class:`ImportResult`.  A failed ``awx import`` is reported via
+            :attr:`ImportResult.errors` rather than raised.
+
+        Raises:
+            ValueError: If *on_conflict* is not a known policy.
+            AwxClientError: If *object_type* is unknown.
+        """
+        if on_conflict not in _CONFLICT_POLICIES:
+            raise ValueError(f"Unknown on_conflict policy: {on_conflict!r}")
+
+        obj_type = self._object_types.get(object_type)
+        if obj_type is None:
+            raise AwxClientError(f"Unknown object type: {object_type!r}")
+
+        result = ImportResult()
+        if not objects:
+            return result
+
+        bundle = {
+            obj_type.awx_type: [self._to_awx(obj_type, o) for o in objects]
+        }
+        payload = json.dumps(bundle)
+
+        try:
+            self._run(["import"], stdin=payload)
+        except AwxCliError as exc:
+            result.errors.append(
+                f"awx import failed for {obj_type.key!r}: {exc}"
+            )
+            return result
+
+        if on_conflict != "update":
+            result.warnings.append(
+                f"on_conflict={on_conflict!r} is not yet enforced; "
+                "performed a standard import (update semantics)"
+            )
+        return result
+
+    def _to_awx(
+        self, obj_type: ObjectType, canonical: CanonicalObject
+    ) -> dict[str, Any]:
+        """Translate one canonical object into its native AWX asset form.
+
+        Only whitelisted fields are written; relations are expanded to AWX
+        natural keys (carrying ``type`` and, for org-scoped targets, a nested
+        organization), never IDs.
+        """
+        relations = {rel.field: rel for rel in obj_type.relations}
+        asset: dict[str, Any] = {}
+        for field_name in obj_type.fields:
+            if field_name not in canonical.fields:
+                continue
+            value = canonical.fields[field_name]
+            rel = relations.get(field_name)
+            if rel is not None:
+                target = self._object_types.get(rel.target_type)
+                if rel.many:
+                    items = value if isinstance(value, (list, tuple)) else []
+                    refs = [_ref_to_awx(item, target) for item in items]
+                    asset[field_name] = [r for r in refs if r is not None]
+                else:
+                    reference = _ref_to_awx(value, target)
+                    if reference is not None:
+                        asset[field_name] = reference
+            else:
+                asset[field_name] = value
+
+        # awx import identifies each asset by its own natural key, so it must
+        # be present (awxkit raises KeyError('natural_key') otherwise).
+        natural_key = self._asset_natural_key(obj_type, canonical)
+        if natural_key is not None:
+            asset["natural_key"] = natural_key
+        return asset
+
+    def _asset_natural_key(
+        self, obj_type: ObjectType, canonical: CanonicalObject
+    ) -> dict[str, Any] | None:
+        """Build the AWX ``natural_key`` for *canonical* as an import asset.
+
+        Uses the object's identity metadata when present, otherwise derives it
+        from the natural-key fields.  An object is its own natural-key
+        reference, so the same reference adapter is reused.
+        """
+        if canonical.natural_key is not None:
+            nk_value: Any = canonical.natural_key
+        else:
+            nk_value = {
+                key: canonical.fields.get(key) for key in obj_type.natural_key
+            }
+        return _ref_to_awx(nk_value, obj_type)
 
     def exists(self, object_type: str, identity: tuple) -> bool:
-        """Not implemented in this phase."""
-        raise NotImplementedError(
-            "AwxCliClient.exists is implemented in a later phase"
-        )
+        """Return whether an object with *identity* exists in AWX.
+
+        Exports the type and checks whether any object's natural-key identity
+        matches *identity*.  "Not found" and query failures both yield
+        ``False`` — this method never raises for a missing object.
+
+        Args:
+            object_type: Registry key of the type to check.
+            identity: Natural-key identity tuple
+                (:meth:`CanonicalObject.identity`).
+
+        Returns:
+            ``True`` if a matching object exists, ``False`` otherwise.
+
+        Raises:
+            AwxClientError: Only if *object_type* is unknown (a misuse), never
+                for a missing object.
+        """
+        obj_type = self._object_types.get(object_type)
+        if obj_type is None:
+            raise AwxClientError(f"Unknown object type: {object_type!r}")
+
+        try:
+            existing = self.export(object_type)
+        except (AwxClientError, AwxCliError) as exc:
+            log.debug(
+                "exists(%s): could not query AWX, treating as not found: %s",
+                object_type,
+                exc,
+            )
+            return False
+
+        target = tuple(identity)
+        for obj in existing:
+            try:
+                if obj.identity(obj_type.natural_key) == target:
+                    return True
+            except KeyError:
+                continue
+        return False
 
 
 def make_client(

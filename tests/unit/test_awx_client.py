@@ -128,18 +128,6 @@ def test_list_organizations_invalid_json_raises() -> None:
 # -- not-yet-implemented methods --------------------------------------
 
 
-def test_import_objects_not_implemented() -> None:
-    client = AwxCliClient(_conn(), cli=FakeCli())
-    with pytest.raises(NotImplementedError):
-        client.import_objects("job_templates", [], on_conflict="update")
-
-
-def test_exists_not_implemented() -> None:
-    client = AwxCliClient(_conn(), cli=FakeCli())
-    with pytest.raises(NotImplementedError):
-        client.exists("job_templates", ("Deploy", "Default"))
-
-
 # -- ImportResult -----------------------------------------------------
 
 

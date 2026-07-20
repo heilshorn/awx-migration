@@ -19,17 +19,20 @@ import sys
 from pathlib import Path
 
 from lib.archive import Archive, ArchiveError
-from lib.awx_cli import AwxCliError
-from lib.awx_client import AwxClientError, make_client
-from lib.awx_connection import AwxConnectionError, resolve_connection
 from lib.awx_objects import OBJECT_TYPES, ObjectType
+from lib.cli_common import (
+    COMMON_CLI_ERRORS,
+    build_connection,
+    default_output_directory,
+    list_organizations,
+    print_export_summary,
+)
 from lib.config import NAMESPACE
 from lib.exporter import ExportError, Exporter, ExportSummary
-from lib.kubectl import Kubectl, KubectlError
 from lib.logger import setup_logger
 from lib import utils
 
-VERSION = "0.1.0"
+VERSION = "2.0.0"
 
 # Sentinel value for --organization that triggers "list organizations".
 _ORG_LS = "ls"
@@ -165,14 +168,6 @@ def _validate_selection(
         raise _ExportUsageError("--name requires exactly one --type")
 
 
-def _list_organizations(client) -> None:  # type: ignore[no-untyped-def]
-    """Print all organization names and return."""
-    names = client.list_organizations()
-    log.info("Organizations (%d):", len(names))
-    for name in names:
-        print(name)
-
-
 def _maybe_archive(
     args: argparse.Namespace, output_dir: Path
 ) -> tuple[Path, int] | None:
@@ -193,13 +188,8 @@ def _maybe_archive(
 def _print_summary(
     summary: ExportSummary, archive_info: tuple[Path, int] | None
 ) -> None:
-    """Log the final export summary."""
-    total = sum(summary.counts.values())
-    types = ", ".join(sorted(summary.counts)) or "(none)"
-    log.info("Export successful")
-    log.info("  Types     : %s", types)
-    log.info("  Objects   : %d", total)
-    log.info("  Directory : %s", summary.directory)
+    """Log the final export summary (shared summary plus the archive line)."""
+    print_export_summary(summary)
     if archive_info is not None:
         archive_file, size = archive_info
         log.info("  Archive   : %s (%s)", archive_file, utils.human_size(size))
@@ -213,21 +203,21 @@ def main(argv: list[str] | None = None) -> None:
     log.info("AWX Export %s", VERSION)
 
     try:
-        kubectl = Kubectl(namespace=args.namespace)
-        connection = resolve_connection(kubectl, args)
-        client = make_client(connection)
+        _kubectl, _connection, client = build_connection(args)
 
         # --organization ls: list organizations and stop.
         if args.organization == _ORG_LS:
-            _list_organizations(client)
+            list_organizations(client)
             return
 
         selected = _select_types(args)
         _validate_selection(args, selected)
 
         organization = args.organization
-        output_dir = Path(
-            args.output or f"awx-export-{utils.timestamp()}"
+        output_dir = (
+            Path(args.output)
+            if args.output
+            else default_output_directory("awx-export")
         )
         log.info("Output    : %s", output_dir)
 
@@ -253,10 +243,7 @@ def main(argv: list[str] | None = None) -> None:
         _print_summary(summary, archive_info)
 
     except (
-        KubectlError,
-        AwxConnectionError,
-        AwxCliError,
-        AwxClientError,
+        *COMMON_CLI_ERRORS,
         ExportError,
         ArchiveError,
         _ExportUsageError,

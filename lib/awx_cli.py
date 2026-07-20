@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -21,6 +22,15 @@ from typing import Optional
 log: logging.Logger = logging.getLogger("awx-migration")
 
 _BINARY_NAME: str = "awx"
+
+#: Matches ANSI escape sequences.  Some ``awx`` builds colourise their JSON
+#: output even when stdout is not a TTY (wrapping it in e.g. ``\x1b[32m … \x1b[0m``),
+#: which would break downstream ``json.loads``.  Stripping these here keeps the
+#: wrapper's contract — "return the binary's textual output" — while ensuring
+#: callers receive clean, parseable text.  Real payloads never contain ``\x1b``.
+_ANSI_ESCAPE: re.Pattern[str] = re.compile(
+    r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])"
+)
 
 
 class AwxCliError(RuntimeError):
@@ -116,8 +126,8 @@ class AwxCli:
                     env=run_env,
                 )
                 if result.returncode == 0:
-                    return result.stdout.strip()
-                stderr = (result.stderr or "").strip()
+                    return _ANSI_ESCAPE.sub("", result.stdout).strip()
+                stderr = _ANSI_ESCAPE.sub("", result.stderr or "").strip()
                 log.warning(
                     "awx failed (attempt %d/%d, rc=%d): %s",
                     attempt,
