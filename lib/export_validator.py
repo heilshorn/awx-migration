@@ -251,6 +251,11 @@ class ExportValidator:
             result.errors.append(f"{file_name}: 'objects' must be a list")
             return
 
+        raw_natural_keys = data.get("natural_keys")
+        natural_keys = (
+            raw_natural_keys if isinstance(raw_natural_keys, list) else []
+        )
+
         count = data.get("count")
         if count != len(objects):
             result.errors.append(
@@ -268,17 +273,32 @@ class ExportValidator:
             )
 
         if obj_type is not None:
-            self._check_objects(obj_type, objects, file_name, result)
+            self._check_objects(
+                obj_type, objects, natural_keys, file_name, result
+            )
 
     def _check_objects(
         self,
         obj_type: ObjectType,
         objects: Sequence[Any],
+        natural_keys: Sequence[Any],
         file_name: str,
         result: ValidationResult,
     ) -> None:
-        """Warn about unknown fields and missing natural keys per object."""
-        allowed = set(obj_type.fields)
+        """Warn about unknown fields and missing natural keys per object.
+
+        Identity is checked against the parallel ``natural_keys`` array when
+        present — that is where org-scoped identity lives for objects (e.g. job
+        templates) that carry no top-level ``organization`` business field.
+        """
+        # Related fields (e.g. credentials references, the survey_spec
+        # document) are stored on the object but are not part of the
+        # business-field whitelist; accept them here.
+        allowed = (
+            set(obj_type.fields)
+            | {rref.canonical_field for rref in obj_type.related_refs}
+            | {rdoc.canonical_field for rdoc in obj_type.related_docs}
+        )
         for index, raw in enumerate(objects):
             if not isinstance(raw, dict):
                 result.errors.append(
@@ -293,7 +313,15 @@ class ExportValidator:
                     f"{unknown}"
                 )
 
-            canonical = CanonicalObject(type=obj_type.key, fields=raw)
+            natural_key = (
+                natural_keys[index]
+                if index < len(natural_keys)
+                and isinstance(natural_keys[index], dict)
+                else None
+            )
+            canonical = CanonicalObject(
+                type=obj_type.key, fields=raw, natural_key=natural_key
+            )
             try:
                 canonical.identity(obj_type.natural_key)
             except KeyError:

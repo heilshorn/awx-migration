@@ -33,10 +33,13 @@ class FakeAwxClient(AwxClient):
         self,
         results: dict[str, ImportResult] | None = None,
         events: list[str] | None = None,
+        missing: Sequence[Mapping[str, object]] | None = None,
     ) -> None:
         self._results = results or {}
         self._events = events
+        self._missing = list(missing or [])
         self.import_calls: list[tuple[str, list[CanonicalObject], str]] = []
+        self.missing_credentials_calls: list[list[Mapping[str, object]]] = []
 
     def list_organizations(self) -> list[str]:  # pragma: no cover
         return []
@@ -58,6 +61,10 @@ class FakeAwxClient(AwxClient):
 
     def exists(self, object_type, identity):  # pragma: no cover
         raise NotImplementedError
+
+    def missing_credentials(self, refs):
+        self.missing_credentials_calls.append(list(refs))
+        return list(self._missing)
 
 
 class FakeValidator:
@@ -272,6 +279,66 @@ def test_empty_bundle_imports_nothing(tmp_path: Path) -> None:
     assert summary.object_count == 0
     assert summary.imported_types == []
     assert isinstance(summary, ImportSummary)
+
+
+# ---------------------------------------------------------------------------
+# Credential references (pre-flight)
+# ---------------------------------------------------------------------------
+
+
+def _cred(name: str) -> dict[str, object]:
+    return {
+        "name": name,
+        "credential_type": {"name": "Machine", "kind": "ssh"},
+        "organization": None,
+    }
+
+
+def _jt_with_creds(name: str, creds: list[dict[str, object]]) -> CanonicalObject:
+    return CanonicalObject(
+        "job_templates",
+        {"name": name, "organization": "Default", "credentials": creds},
+        natural_key={"name": name, "organization": "Default"},
+    )
+
+
+def test_present_credentials_are_recorded_and_kept(tmp_path: Path) -> None:
+    _write_bundle(
+        tmp_path,
+        {"job_templates": [_jt_with_creds("Deploy", [_cred("key-ralf")])]},
+    )
+    client = FakeAwxClient(missing=[])  # nothing missing
+    summary = Importer(client).import_path(tmp_path, types=["job_templates"])
+
+    # The credential is recorded as a dependency and left attached.
+    assert any("key-ralf" in c for c in summary.referenced_credentials)
+    assert summary.missing_credentials == []
+    _, objects, _ = client.import_calls[0]
+    assert [c["name"] for c in objects[0].fields["credentials"]] == ["key-ralf"]
+    assert client.missing_credentials_calls  # pre-flight ran
+
+
+def test_missing_credential_is_warned_and_stripped(tmp_path: Path) -> None:
+    ghost = _cred("ghost")
+    _write_bundle(
+        tmp_path,
+        {
+            "job_templates": [
+                _jt_with_creds("Deploy", [_cred("key-ralf"), ghost])
+            ]
+        },
+    )
+    client = FakeAwxClient(missing=[ghost])
+    summary = Importer(client).import_path(tmp_path, types=["job_templates"])
+
+    # Job template still imported, but without the missing credential.
+    _, objects, _ = client.import_calls[0]
+    assert [c["name"] for c in objects[0].fields["credentials"]] == ["key-ralf"]
+    assert any("ghost" in m for m in summary.missing_credentials)
+    assert any(
+        "ghost" in w and "not present in the target" in w
+        for w in summary.warnings
+    )
 
 
 def test_dummy_type_from_registry(tmp_path: Path) -> None:

@@ -42,12 +42,29 @@ def test_natural_key_and_org_scope_invariant() -> None:
 
 
 def test_dependencies_reference_known_types() -> None:
-    """Every depends_on / relation target refers to a registered type."""
+    """Every depends_on / relation / related-ref target is a registered type."""
     for obj_type in OBJECT_TYPES.values():
         for dep in obj_type.depends_on:
             assert dep in OBJECT_TYPES
         for rel in obj_type.relations:
             assert rel.target_type in OBJECT_TYPES
+        for rref in obj_type.related_refs:
+            assert rref.target_type in OBJECT_TYPES
+
+
+def test_credentials_are_a_reference_only_related_ref() -> None:
+    """Job templates reference credentials via a related-ref; credentials and
+    credential types exist only as reference-only (non-exportable) types."""
+    jt = OBJECT_TYPES["job_templates"]
+    cred_refs = [rr for rr in jt.related_refs if rr.target_type == "credentials"]
+    assert cred_refs, "job_templates must declare a credentials related-ref"
+    assert cred_refs[0].canonical_field == "credentials"
+    assert cred_refs[0].awx_related_key == "credentials"
+
+    assert OBJECT_TYPES["credentials"].exportable is False
+    assert OBJECT_TYPES["credential_types"].exportable is False
+    # Exportable business types stay exportable.
+    assert OBJECT_TYPES["job_templates"].exportable is True
 
 
 def test_reserved_hooks_default_to_none() -> None:

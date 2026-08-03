@@ -205,6 +205,108 @@ def test_many_relation_maps_each_reference() -> None:
     assert obj.fields["members"] == ["A", "B", None]
 
 
+# -- credential references (related M2M) ------------------------------
+
+
+def _cred_related(**extra: Any) -> dict[str, Any]:
+    """A realistic awxkit ``related.credentials`` entry (org-less Machine)."""
+    return {
+        "type": "credential",
+        "name": "key-ralf",
+        "organization": None,
+        "credential_type": {
+            "type": "credential_type",
+            "name": "Machine",
+            "kind": "ssh",
+        },
+        **extra,
+    }
+
+
+def test_credentials_reduced_to_agnostic_natural_key() -> None:
+    client = _client(
+        _jt_export(related={"labels": [], "credentials": [_cred_related()]})
+    )
+    obj = client.export("job_templates")[0]
+    # type markers stripped; credential_type keeps name+kind; org preserved.
+    assert obj.fields["credentials"] == [
+        {
+            "name": "key-ralf",
+            "credential_type": {"name": "Machine", "kind": "ssh"},
+            "organization": None,
+        }
+    ]
+
+
+def test_job_template_without_credentials_has_no_field() -> None:
+    # related present but no credentials key -> field omitted entirely.
+    client = _client(_jt_export())
+    obj = client.export("job_templates")[0]
+    assert "credentials" not in obj.fields
+
+
+def test_org_scoped_credential_keeps_org_name() -> None:
+    client = _client(
+        _jt_export(
+            related={
+                "credentials": [
+                    _cred_related(
+                        organization={"name": "ls", "type": "organization"}
+                    )
+                ]
+            }
+        )
+    )
+    obj = client.export("job_templates")[0]
+    assert obj.fields["credentials"][0]["organization"] == "ls"
+
+
+# -- survey specification (related doc) -------------------------------
+
+
+_SURVEY = {
+    "name": "Deploy survey",
+    "description": "",
+    "spec": [
+        {
+            "question_name": "User",
+            "variable": "user",
+            "type": "text",
+            "default": "",
+            "required": True,
+        },
+        {
+            "question_name": "Password",
+            "variable": "pw",
+            "type": "password",
+            "default": "$encrypted$",
+            "required": False,
+        },
+    ],
+}
+
+
+def test_survey_spec_captured_verbatim() -> None:
+    client = _client(
+        _jt_export(survey_enabled=True, related={"survey_spec": _SURVEY})
+    )
+    obj = client.export("job_templates")[0]
+    assert obj.fields["survey_enabled"] is True
+    # The whole survey document (incl. the $encrypted$ password default) is
+    # carried through unchanged.
+    assert obj.fields["survey_spec"] == _SURVEY
+
+
+def test_empty_survey_spec_is_omitted() -> None:
+    # awxkit emits an empty {} when a job template has no survey.
+    client = _client(
+        _jt_export(survey_enabled=False, related={"survey_spec": {}})
+    )
+    obj = client.export("job_templates")[0]
+    assert "survey_spec" not in obj.fields
+    assert obj.fields["survey_enabled"] is False
+
+
 # -- canonical object -------------------------------------------------
 
 

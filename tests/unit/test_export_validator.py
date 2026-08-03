@@ -242,6 +242,74 @@ def test_unknown_field_produces_warning_not_error(tmp_path: Path) -> None:
     assert any("unknown field" in w for w in result.warnings)
 
 
+def _write_jt_only_bundle(
+    tmp_path: Path, jt: CanonicalObject
+) -> None:
+    write_type_file(tmp_path / "job_templates.json", "job_templates", [jt], **_META)
+    write_manifest(
+        tmp_path / "manifest.json",
+        object_types={"job_templates": {"count": 1, "file": "job_templates.json"}},
+        **_META,
+    )
+
+
+def test_no_false_positive_when_org_lives_in_natural_key(
+    tmp_path: Path,
+) -> None:
+    # A real job template carries no top-level `organization`; its identity is
+    # in the parallel natural_keys[] array. The validator must read that and
+    # NOT warn about a missing natural-key field.
+    jt = CanonicalObject(
+        "job_templates",
+        {"name": "Deploy", "playbook": "p.yml"},
+        natural_key={"name": "Deploy", "organization": "Default"},
+    )
+    _write_jt_only_bundle(tmp_path, jt)
+
+    result = ExportValidator().validate(tmp_path)
+    assert result.valid is True
+    assert not any("missing natural-key" in w for w in result.warnings)
+
+
+def test_credentials_field_is_not_flagged_unknown(tmp_path: Path) -> None:
+    jt = CanonicalObject(
+        "job_templates",
+        {
+            "name": "Deploy",
+            "credentials": [
+                {
+                    "name": "key-ralf",
+                    "credential_type": {"name": "Machine", "kind": "ssh"},
+                    "organization": None,
+                }
+            ],
+        },
+        natural_key={"name": "Deploy", "organization": "Default"},
+    )
+    _write_jt_only_bundle(tmp_path, jt)
+
+    result = ExportValidator().validate(tmp_path)
+    assert result.valid is True
+    assert not any("unknown field" in w for w in result.warnings)
+
+
+def test_survey_spec_field_is_not_flagged_unknown(tmp_path: Path) -> None:
+    jt = CanonicalObject(
+        "job_templates",
+        {
+            "name": "Deploy",
+            "survey_enabled": True,
+            "survey_spec": {"name": "S", "description": "", "spec": []},
+        },
+        natural_key={"name": "Deploy", "organization": "Default"},
+    )
+    _write_jt_only_bundle(tmp_path, jt)
+
+    result = ExportValidator().validate(tmp_path)
+    assert result.valid is True
+    assert not any("unknown field" in w for w in result.warnings)
+
+
 # -- multiple errors & non-abort --------------------------------------
 
 

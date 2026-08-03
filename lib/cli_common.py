@@ -109,6 +109,13 @@ def print_export_summary(summary: Any) -> None:
     log.info("  Types     : %s", types)
     log.info("  Objects   : %d", total)
     log.info("  Directory : %s", summary.directory)
+    referenced = getattr(summary, "referenced_credentials", None)
+    if referenced:
+        log.info(
+            "  Referenced credentials (must exist in the import target):"
+        )
+        for label in referenced:
+            log.info("    - %s", label)
 
 
 def print_import_summary(summary: Any) -> None:
@@ -125,6 +132,16 @@ def print_import_summary(summary: Any) -> None:
     log.info("  Created   : %d", len(summary.created))
     log.info("  Updated   : %d", len(summary.updated))
     log.info("  Skipped   : %d", len(summary.skipped))
+    referenced = getattr(summary, "referenced_credentials", None)
+    if referenced:
+        log.info("  Referenced credentials (expected in the target):")
+        for label in referenced:
+            log.info("    - %s", label)
+    missing = getattr(summary, "missing_credentials", None)
+    if missing:
+        log.warning("  Missing credentials (not attached — create them first):")
+        for label in missing:
+            log.warning("    - %s", label)
     for warning in summary.warnings:
         log.warning("  %s", warning)
     for error in summary.errors:

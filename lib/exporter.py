@@ -11,7 +11,7 @@ supplied to it.  It writes exactly one file per object type plus a
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,9 +23,31 @@ from .export_format import ExportFormatError, write_manifest, write_type_file
 
 _MANIFEST_FILENAME: str = "manifest.json"
 
+#: Registry key of the reference-only credentials type.
+_CREDENTIALS_TYPE: str = "credentials"
+
 
 class ExportError(RuntimeError):
     """Raised when an export bundle cannot be written."""
+
+
+def _cred_label(ref: object) -> str:
+    """Return a human-readable label for a credential reference."""
+    if not isinstance(ref, Mapping):
+        return repr(ref)
+    name = ref.get("name")
+    ct = ref.get("credential_type")
+    if isinstance(ct, Mapping):
+        ct = ct.get("name")
+    org = ref.get("organization")
+    if isinstance(org, Mapping):
+        org = org.get("name")
+    label = f"{name!r}"
+    if ct:
+        label += f" ({ct})"
+    if org:
+        label += f" in org {org!r}"
+    return label
 
 
 @dataclass
@@ -35,10 +57,14 @@ class ExportSummary:
     Attributes:
         directory: Directory the bundle was written to.
         counts: Mapping of object-type key to the number of objects written.
+        referenced_credentials: Labels of credentials referenced by exported
+            objects — the credentials that must already exist in any target
+            these objects are later imported into.
     """
 
     directory: Path
     counts: dict[str, int] = field(default_factory=dict)
+    referenced_credentials: list[str] = field(default_factory=list)
 
 
 class Exporter:
@@ -160,8 +186,12 @@ class Exporter:
         out = Path(output_dir)
         counts: dict[str, int] = {}
         manifest_types: dict[str, dict[str, object]] = {}
+        referenced_credentials: list[str] = []
         try:
             for object_type, objects in entries:
+                self._collect_referenced_credentials(
+                    object_type, objects, referenced_credentials
+                )
                 write_type_file(
                     out / object_type.filename,
                     object_type.key,
@@ -188,4 +218,34 @@ class Exporter:
             raise ExportError(
                 f"Failed to write export bundle to '{out}': {exc}"
             ) from exc
-        return ExportSummary(directory=out, counts=counts)
+        return ExportSummary(
+            directory=out,
+            counts=counts,
+            referenced_credentials=referenced_credentials,
+        )
+
+    @staticmethod
+    def _collect_referenced_credentials(
+        object_type: ObjectType,
+        objects: Sequence[CanonicalObject],
+        into: list[str],
+    ) -> None:
+        """Append the unique credential-reference labels of *objects* to *into*.
+
+        Credentials are surfaced as a dependency: they are never exported as
+        objects, so they must already exist wherever these objects are
+        imported.
+        """
+        cred_fields = [
+            rref.canonical_field
+            for rref in object_type.related_refs
+            if rref.target_type == _CREDENTIALS_TYPE
+        ]
+        if not cred_fields:
+            return
+        for obj in objects:
+            for cred_field in cred_fields:
+                for ref in obj.fields.get(cred_field) or []:
+                    label = _cred_label(ref)
+                    if label not in into:
+                        into.append(label)

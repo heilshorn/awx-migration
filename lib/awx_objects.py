@@ -38,6 +38,58 @@ class Relation:
 
 
 @dataclass(frozen=True)
+class RelatedRef:
+    """Declares a many-to-many reference sourced from AWX's ``related`` block.
+
+    Unlike :class:`Relation`, which maps a top-level AWX field, a
+    ``RelatedRef`` addresses a reference list that AWX exposes only under an
+    object's ``related`` sub-object (e.g. a job template's credentials live at
+    ``raw["related"]["credentials"]``, not as a scalar field).  The references
+    are stored in the canonical object as a plain list under
+    :attr:`canonical_field`, in the same AWX-agnostic natural-key form as
+    scalar relations; only :class:`~lib.awx_client.AwxClient` knows they come
+    from — and go back into — the ``related`` block on import.
+
+    Attributes:
+        canonical_field: Canonical field holding the reference list, e.g.
+            ``"credentials"``.
+        awx_related_key: Key under AWX's ``related`` object, e.g.
+            ``"credentials"``.
+        target_type: Registry key of the referenced type, e.g.
+            ``"credentials"``.
+        many: ``True`` when the field holds a list of references (the only
+            supported mode today; kept for symmetry with :class:`Relation`).
+    """
+
+    canonical_field: str
+    awx_related_key: str
+    target_type: str
+    many: bool = True
+
+
+@dataclass(frozen=True)
+class RelatedDoc:
+    """Declares an embedded sub-document sourced from AWX's ``related`` block.
+
+    Unlike :class:`RelatedRef` — a *reference* to external objects reduced to
+    natural keys — a ``RelatedDoc`` is intrinsic content that belongs to the
+    object itself (e.g. a job template's survey specification at
+    ``raw["related"]["survey_spec"]``).  It is copied **verbatim** into the
+    canonical object under :attr:`canonical_field` and written back under the
+    same ``related`` key on import; nothing needs to pre-exist in the target.
+
+    Attributes:
+        canonical_field: Canonical field holding the document, e.g.
+            ``"survey_spec"``.
+        awx_related_key: Key under AWX's ``related`` object, e.g.
+            ``"survey_spec"``.
+    """
+
+    canonical_field: str
+    awx_related_key: str
+
+
+@dataclass(frozen=True)
 class ObjectType:
     """Declarative description of one supported AWX object type.
 
@@ -61,6 +113,18 @@ class ObjectType:
             this object (e.g. ``"job_template"`` for ``job_templates``).  The
             reference adapter needs it to build AWX natural keys on import.
         relations: Reference fields and their target types.
+        related_refs: Many-to-many references sourced from AWX's ``related``
+            block (e.g. a job template's credentials).  See
+            :class:`RelatedRef`.
+        related_docs: Embedded sub-documents sourced from AWX's ``related``
+            block and carried verbatim (e.g. a job template's survey
+            specification).  See :class:`RelatedDoc`.
+        exportable: ``True`` for object types that are exported/imported in
+            their own right.  ``False`` marks a *reference-only* type that
+            exists in the registry solely to describe another type's natural
+            key (e.g. ``credentials``/``credential_types`` used to rebuild a
+            job template's credential references); such types are never
+            selectable on the CLI and never written to a bundle.
         depends_on: Registry keys that must be imported before this type.
         validator: Optional ``(CanonicalObject) -> list[str]`` hook returning
             validation messages.  Reserved for later phases.
@@ -81,6 +145,9 @@ class ObjectType:
     awx_key: str | None = None
     awx_type_name: str | None = None
     relations: tuple[Relation, ...] = ()
+    related_refs: tuple[RelatedRef, ...] = ()
+    related_docs: tuple[RelatedDoc, ...] = ()
+    exportable: bool = True
     depends_on: tuple[str, ...] = ()
     validator: Callable[..., Any] | None = None
     exporter: Callable[..., Any] | None = None
@@ -177,6 +244,7 @@ OBJECT_TYPES: dict[str, ObjectType] = {
             "job_tags",
             "skip_tags",
             "ask_variables_on_launch",
+            "survey_enabled",
         ),
         awx_type_name="job_template",
         relations=(
@@ -184,7 +252,45 @@ OBJECT_TYPES: dict[str, ObjectType] = {
             Relation("inventory", "inventories"),
             Relation("project", "projects"),
         ),
+        # Credentials are a many-to-many attachment exposed only under the job
+        # template's ``related`` block; captured as natural-key references and
+        # re-attached on import (never as credential objects, never secrets).
+        related_refs=(
+            RelatedRef("credentials", "credentials", "credentials"),
+        ),
+        # The survey specification is intrinsic content (not a reference); it
+        # lives under ``related.survey_spec`` and is carried verbatim.
+        related_docs=(RelatedDoc("survey_spec", "survey_spec"),),
         depends_on=("organizations", "projects", "inventories"),
+    ),
+    # -- reference-only types (exportable=False) ---------------------------
+    # These are never exported or imported as objects; they exist only so the
+    # reference adapter can reduce/rebuild the compound natural key of a job
+    # template's credential references.  Credential *secrets* are fundamentally
+    # unavailable from an export and belong to backup/restore.
+    "credentials": ObjectType(
+        key="credentials",
+        cli_flag="--credentials",
+        filename="credentials.json",
+        natural_key=("name", "credential_type", "organization"),
+        org_scoped=True,
+        fields=(),
+        awx_type_name="credential",
+        relations=(
+            Relation("credential_type", "credential_types"),
+            Relation("organization", "organizations"),
+        ),
+        exportable=False,
+    ),
+    "credential_types": ObjectType(
+        key="credential_types",
+        cli_flag="--credential_types",
+        filename="credential_types.json",
+        natural_key=("name", "kind"),
+        org_scoped=False,
+        fields=(),
+        awx_type_name="credential_type",
+        exportable=False,
     ),
 }
 

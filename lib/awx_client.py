@@ -106,6 +106,22 @@ class AwxClient(ABC):
                 (:meth:`CanonicalObject.identity`).
         """
 
+    @abstractmethod
+    def missing_credentials(
+        self, refs: Sequence[Mapping[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Return the subset of credential *refs* absent from the target AWX.
+
+        Args:
+            refs: Canonical credential references (reduced natural-key dicts,
+                as stored on a job template's ``credentials`` field).
+
+        Returns:
+            The references that do not resolve to an existing credential.  A
+            query failure yields an empty list (nothing known-missing) so an
+            import is never blocked by a transient read error.
+        """
+
 
 # ---------------------------------------------------------------------------
 # Reference adapter — AWX natural keys ⇄ canonical references.
@@ -214,6 +230,127 @@ def _natural_key_to_canonical(raw: Any) -> dict[str, Any] | None:
         else:
             clean[key] = value
     return clean or None
+
+
+# ---------------------------------------------------------------------------
+# Recursive natural-key adapter — for compound references (e.g. credentials).
+#
+# A reference to a type whose natural key is exactly ``("name",)`` is a plain
+# name string (matching the scalar-relation convention above); any richer
+# natural key becomes a dict of its natural-key fields, recursing into nested
+# references.  This generalises — and stays byte-compatible with — the
+# organization/inventory/project convention, and additionally handles a
+# credential's ``(name, credential_type, organization)`` key where
+# ``credential_type`` itself carries ``(name, kind)``.
+# ---------------------------------------------------------------------------
+
+
+def _as_ref_mapping(value: Any) -> dict[str, Any] | None:
+    """Coerce a reference *value* to a plain mapping, or ``None``.
+
+    A bare name string is promoted to ``{"name": value}`` so single-field
+    natural keys accept both shapes.
+    """
+    if isinstance(value, str):
+        return {"name": value}
+    if isinstance(value, Mapping):
+        return dict(value)
+    return None
+
+
+def _ref_from_awx(
+    value: Any,
+    target: "ObjectType | None",
+    object_types: Mapping[str, "ObjectType"],
+) -> Any:
+    """Reduce one AWX reference to its AWX-agnostic canonical form (recursive).
+
+    Returns a bare name for a ``("name",)`` target, a dict of natural-key
+    fields otherwise (nested references reduced in turn), or ``None`` when the
+    reference cannot be resolved.
+    """
+    if value is None:
+        return None
+    raw = _as_ref_mapping(value)
+    if raw is None:
+        return None
+    if target is None:
+        name = raw.get("name")
+        return name if isinstance(name, str) else None
+    if tuple(target.natural_key) == ("name",):
+        name = raw.get("name")
+        return name if isinstance(name, str) else None
+
+    relations = {rel.field: rel for rel in target.relations}
+    result: dict[str, Any] = {}
+    for field_name in target.natural_key:
+        sub = raw.get(field_name)
+        rel = relations.get(field_name)
+        if rel is not None:
+            result[field_name] = _ref_from_awx(
+                sub, object_types.get(rel.target_type), object_types
+            )
+        else:
+            result[field_name] = sub
+    return result
+
+
+def _ref_to_awx_nk(
+    value: Any,
+    target: "ObjectType | None",
+    object_types: Mapping[str, "ObjectType"],
+) -> Any:
+    """Rebuild the AWX-import natural key from a canonical reference (recursive).
+
+    The inverse of :func:`_ref_from_awx`.  Produces the fully typed, nested
+    natural key ``awx import`` expects (each level carries ``type``), or
+    ``None`` when the reference has no usable name.  A ``None`` sub-reference
+    (e.g. an org-less credential's ``organization``) is preserved as ``None``,
+    matching AWX's own export shape.
+    """
+    if value is None:
+        return None
+    raw = _as_ref_mapping(value)
+    if raw is None:
+        return None
+    name = raw.get("name")
+    if not isinstance(name, str):
+        return None
+    type_name = target.awx_type_name if target is not None else None
+    if target is None or tuple(target.natural_key) == ("name",):
+        return {"type": type_name, "name": name}
+
+    relations = {rel.field: rel for rel in target.relations}
+    ref: dict[str, Any] = {"type": type_name}
+    for field_name in target.natural_key:
+        sub = raw.get(field_name)
+        rel = relations.get(field_name)
+        if rel is not None:
+            ref[field_name] = _ref_to_awx_nk(
+                sub, object_types.get(rel.target_type), object_types
+            )
+        else:
+            ref[field_name] = sub
+    return ref
+
+
+def _credential_identity(ref: Any) -> tuple[Any, Any, Any]:
+    """Return a comparable identity for a credential reference.
+
+    Normalises both the reduced dict form (``credential_type`` as a nested
+    ``{"name", "kind"}`` dict) and a flattened form (``credential_type`` as a
+    plain name) to ``(name, credential_type_name, organization_name)``.
+    """
+    if not isinstance(ref, Mapping):
+        return (None, None, None)
+    name = ref.get("name")
+    ct = ref.get("credential_type")
+    if isinstance(ct, Mapping):
+        ct = ct.get("name")
+    org = ref.get("organization")
+    if isinstance(org, Mapping):
+        org = org.get("name")
+    return (name, ct, org)
 
 
 class AwxCliClient(AwxClient):
@@ -433,6 +570,33 @@ class AwxCliClient(AwxClient):
                     fields[field_name] = _ref_to_canonical(value, target)
             else:
                 fields[field_name] = value
+
+        # References and embedded documents sourced from AWX's ``related``
+        # block.
+        if obj_type.related_refs or obj_type.related_docs:
+            related = raw.get("related")
+            related = related if isinstance(related, Mapping) else {}
+            # Embedded documents (e.g. survey_spec) are carried verbatim, only
+            # when they hold content — an empty ``{}`` means "no survey".
+            for rdoc in obj_type.related_docs:
+                value = related.get(rdoc.awx_related_key)
+                if isinstance(value, Mapping) and value:
+                    fields[rdoc.canonical_field] = dict(value)
+            for rref in obj_type.related_refs:
+                target = self._object_types.get(rref.target_type)
+                raw_items = related.get(rref.awx_related_key)
+                items = raw_items if isinstance(raw_items, (list, tuple)) else []
+                refs = [
+                    _ref_from_awx(item, target, self._object_types)
+                    for item in items
+                ]
+                refs = [r for r in refs if r is not None]
+                # Store the field only when there are references — an object
+                # with no credentials carries no ``credentials`` field, mirroring
+                # the whitelist's "present fields only" behaviour.
+                if refs:
+                    fields[rref.canonical_field] = refs
+
         natural_key = _natural_key_to_canonical(raw.get("natural_key"))
         return CanonicalObject(
             type=obj_type.key, fields=fields, natural_key=natural_key
@@ -533,6 +697,32 @@ class AwxCliClient(AwxClient):
             else:
                 asset[field_name] = value
 
+        # References and embedded documents go back into AWX's ``related``
+        # block.  The block is always emitted as a dict when the type declares
+        # any related member — awxkit's import iterates ``related`` and chokes
+        # on a missing/None block ("argument of type 'NoneType' is not
+        # iterable").
+        if obj_type.related_refs or obj_type.related_docs:
+            related_out: dict[str, Any] = {}
+            for rref in obj_type.related_refs:
+                target = self._object_types.get(rref.target_type)
+                values = canonical.fields.get(rref.canonical_field)
+                values = values if isinstance(values, (list, tuple)) else []
+                refs = [
+                    _ref_to_awx_nk(v, target, self._object_types)
+                    for v in values
+                ]
+                related_out[rref.awx_related_key] = [
+                    r for r in refs if r is not None
+                ]
+            # Embedded documents (e.g. survey_spec) are written back verbatim,
+            # only when present on the object.
+            for rdoc in obj_type.related_docs:
+                value = canonical.fields.get(rdoc.canonical_field)
+                if isinstance(value, Mapping) and value:
+                    related_out[rdoc.awx_related_key] = dict(value)
+            asset["related"] = related_out
+
         # awx import identifies each asset by its own natural key, so it must
         # be present (awxkit raises KeyError('natural_key') otherwise).
         natural_key = self._asset_natural_key(obj_type, canonical)
@@ -598,6 +788,39 @@ class AwxCliClient(AwxClient):
             except KeyError:
                 continue
         return False
+
+    def missing_credentials(
+        self, refs: Sequence[Mapping[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Return the subset of credential *refs* absent from the target AWX.
+
+        Lists the target's credentials (reading only their natural keys — the
+        transient query is never written to disk, so the no-secrets guarantee
+        holds) and returns the references whose ``(name, credential_type,
+        organization)`` identity is not present.  Any query failure yields an
+        empty list so an import is never blocked by a transient read error.
+        """
+        wanted = [dict(ref) for ref in refs if isinstance(ref, Mapping)]
+        if not wanted:
+            return []
+        try:
+            existing_objs = self.export("credentials")
+        except (AwxClientError, AwxCliError) as exc:
+            log.warning(
+                "could not list credentials for the pre-flight check; "
+                "not stripping any references: %s",
+                exc,
+            )
+            return []
+        existing = {
+            _credential_identity(obj.natural_key or {})
+            for obj in existing_objs
+        }
+        return [
+            ref
+            for ref in wanted
+            if _credential_identity(ref) not in existing
+        ]
 
 
 def make_client(

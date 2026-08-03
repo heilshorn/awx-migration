@@ -246,6 +246,33 @@ def _wait_for_project_sync(
         time.sleep(_SYNC_POLL_INTERVAL)
 
 
+def _machine_credential_type_id(cli: AwxCli, env: dict[str, str]) -> Any:
+    """Return the id of the built-in ``Machine`` (ssh) credential type."""
+    out = cli.run(
+        ["credential_types", "list", "--name", "Machine", "-f", "json"],
+        env=env,
+    )
+    data = json.loads(out)
+    results = data.get("results", []) if isinstance(data, dict) else []
+    assert results, "built-in 'Machine' credential type not found in AWX"
+    return results[0]["id"]
+
+
+def _associate(
+    cli: AwxCli,
+    env: dict[str, str],
+    resource: str,
+    obj_id: Any,
+    relation: str,
+    target_id: Any,
+) -> None:
+    """Associate *target_id* with *obj_id* on the given *relation* sub-list."""
+    cli.run(
+        [resource, "associate", str(obj_id), f"--{relation}", str(target_id)],
+        env=env,
+    )
+
+
 def _delete_quiet(
     cli: AwxCli, env: dict[str, str], resource: str, obj_id: Any
 ) -> None:
@@ -372,6 +399,74 @@ def provisioned_job_template(
             "inventory": inv_name,
             "job_template": jt_name,
             "playbook": playbook,
+        }
+    finally:
+        for resource, obj_id in reversed(created):
+            _delete_quiet(e2e_cli, env, resource, obj_id)
+
+
+@pytest.fixture
+def provisioned_jt_with_credential(
+    e2e_connection: AwxConnection, e2e_cli: AwxCli
+) -> Iterator[dict[str, str]]:
+    """Provision org → inventory → credential → job template with credential.
+
+    Uses a static local playbook path (no SCM project/sync needed), a manual
+    inventory, and a ``Machine`` credential attached to the job template.  The
+    credential lets the export/import credential-reference path be exercised
+    end to end.  Everything is torn down in reverse dependency order.
+    """
+    env = _awx_env(e2e_connection)
+    suffix = _unique_suffix()
+    org_name = f"{E2E_PREFIX}org-{suffix}"
+    inv_name = f"{E2E_PREFIX}inv-{suffix}"
+    cred_name = f"{E2E_PREFIX}cred-{suffix}"
+    jt_name = f"{E2E_PREFIX}jt-{suffix}"
+    created: list[tuple[str, Any]] = []
+    try:
+        org = _create(
+            e2e_cli, env, "organizations",
+            name=org_name, description="awxmig e2e test organization",
+        )
+        created.append(("organizations", org["id"]))
+        inv = _create(
+            e2e_cli, env, "inventories",
+            name=inv_name, organization=org["id"],
+        )
+        created.append(("inventories", inv["id"]))
+        cred = _create(
+            e2e_cli, env, "credentials",
+            name=cred_name,
+            credential_type=_machine_credential_type_id(e2e_cli, env),
+            organization=org["id"],
+            inputs=json.dumps({"username": "awxmig-e2e"}),
+        )
+        created.append(("credentials", cred["id"]))
+        # A job template needs a resolvable playbook; use a manual (non-SCM)
+        # project so no SCM sync is required.
+        project = _create(
+            e2e_cli, env, "projects",
+            name=f"{E2E_PREFIX}proj-{suffix}",
+            organization=org["id"],
+            scm_type="",
+            local_path="_local",
+        )
+        created.append(("projects", project["id"]))
+        job_template = _create(
+            e2e_cli, env, "job_templates",
+            name=jt_name, job_type="run",
+            inventory=inv["id"], project=project["id"], playbook="ping.yml",
+        )
+        created.append(("job_templates", job_template["id"]))
+        _associate(
+            e2e_cli, env, "job_templates",
+            job_template["id"], "credential", cred["id"],
+        )
+        yield {
+            "organization": org_name,
+            "inventory": inv_name,
+            "credential": cred_name,
+            "job_template": jt_name,
         }
     finally:
         for resource, obj_id in reversed(created):

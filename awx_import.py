@@ -30,7 +30,13 @@ from lib.importer import ImportError as ImporterError
 from lib.importer import Importer
 from lib.logger import setup_logger
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
+
+# Object types selectable on the CLI: reference-only types (e.g. credentials)
+# are excluded — they are never imported as objects.
+_IMPORTABLE_TYPES = sorted(
+    key for key, ot in OBJECT_TYPES.items() if ot.exportable
+)
 
 # Sentinel value for --organization that triggers "list organizations".
 _ORG_LS = "ls"
@@ -73,10 +79,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--type",
         action="append",
         metavar="TYPE",
-        choices=sorted(OBJECT_TYPES),
+        choices=_IMPORTABLE_TYPES,
         help=(
             "Import only this object type (repeatable). "
-            f"One of: {', '.join(sorted(OBJECT_TYPES))}"
+            f"One of: {', '.join(_IMPORTABLE_TYPES)}"
         ),
     )
     p.add_argument(

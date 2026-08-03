@@ -46,6 +46,9 @@ class FakeClient(AwxClient):
     def exists(self, object_type: str, identity: tuple) -> bool:
         raise NotImplementedError  # pragma: no cover - not used here
 
+    def missing_credentials(self, refs):  # pragma: no cover - not used here
+        return []
+
 
 def _exporter(client: FakeClient, object_types: Sequence[ObjectType]) -> Exporter:
     return Exporter(client, object_types, **_META)

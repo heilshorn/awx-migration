@@ -32,7 +32,14 @@ from lib.exporter import ExportError, Exporter, ExportSummary
 from lib.logger import setup_logger
 from lib import utils
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
+
+# Object types selectable on the CLI: reference-only types (e.g. credentials)
+# are excluded — they exist only to describe another type's natural key and are
+# never exported as objects.
+_EXPORTABLE_TYPES = sorted(
+    key for key, ot in OBJECT_TYPES.items() if ot.exportable
+)
 
 # Sentinel value for --organization that triggers "list organizations".
 _ORG_LS = "ls"
@@ -70,10 +77,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--type",
         action="append",
         metavar="TYPE",
-        choices=sorted(OBJECT_TYPES),
+        choices=_EXPORTABLE_TYPES,
         help=(
             "Object type to export (repeatable). "
-            f"One of: {', '.join(sorted(OBJECT_TYPES))}"
+            f"One of: {', '.join(_EXPORTABLE_TYPES)}"
         ),
     )
     p.add_argument(
@@ -145,9 +152,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _select_types(args: argparse.Namespace) -> list[ObjectType]:
-    """Resolve the selected object types from ``--all`` / ``--type``."""
+    """Resolve the selected object types from ``--all`` / ``--type``.
+
+    ``--all`` covers only exportable types; reference-only types (credentials,
+    credential types) are never exported as objects.
+    """
     if args.all:
-        return list(OBJECT_TYPES.values())
+        return [ot for ot in OBJECT_TYPES.values() if ot.exportable]
     return [OBJECT_TYPES[name] for name in (args.type or [])]
 
 

@@ -122,9 +122,10 @@ def test_only_whitelist_fields_are_written() -> None:
     client.import_objects("job_templates", [_job_template()])
     asset = _sent_bundle(cli)["job_templates"][0]
     allowed = set(OBJECT_TYPES["job_templates"].fields)
-    # 'natural_key' is identity metadata the asset must carry, not a business
-    # field; everything else stays within the whitelist.
-    assert set(asset) - {"natural_key"} <= allowed
+    # 'natural_key' is identity metadata and 'related' is the M2M block (e.g.
+    # credentials) — both are structural, not business fields; everything else
+    # stays within the whitelist.
+    assert set(asset) - {"natural_key", "related"} <= allowed
     assert "summary_fields" not in asset
     assert asset["name"] == "Deploy"
     assert asset["playbook"] == "deploy.yml"
@@ -203,6 +204,85 @@ def test_many_relation_becomes_list_of_natural_keys() -> None:
         {"type": "organization", "name": "A"},
         {"type": "organization", "name": "B"},
     ]
+
+
+# -- credential references (related M2M) ------------------------------
+
+
+def _jt_with_creds() -> CanonicalObject:
+    return CanonicalObject(
+        "job_templates",
+        {
+            "name": "Deploy",
+            "credentials": [
+                {
+                    "name": "key-ralf",
+                    "credential_type": {"name": "Machine", "kind": "ssh"},
+                    "organization": None,
+                }
+            ],
+        },
+        natural_key={"name": "Deploy", "organization": "Default"},
+    )
+
+
+def test_credentials_rebuilt_as_typed_related_natural_keys() -> None:
+    client, cli = _client()
+    client.import_objects("job_templates", [_jt_with_creds()])
+    asset = _sent_bundle(cli)["job_templates"][0]
+    assert asset["related"]["credentials"] == [
+        {
+            "type": "credential",
+            "name": "key-ralf",
+            "credential_type": {
+                "type": "credential_type",
+                "name": "Machine",
+                "kind": "ssh",
+            },
+            "organization": None,
+        }
+    ]
+
+
+def test_related_block_always_present_for_job_templates() -> None:
+    # A job template without credentials must still carry a dict `related`
+    # block — awxkit's import iterates it and chokes on a missing/None one.
+    client, cli = _client()
+    client.import_objects("job_templates", [_job_template()])
+    asset = _sent_bundle(cli)["job_templates"][0]
+    assert asset["related"] == {"credentials": []}
+
+
+# -- survey specification (related doc) -------------------------------
+
+
+_SURVEY = {
+    "name": "S",
+    "description": "",
+    "spec": [
+        {"question_name": "User", "variable": "user", "type": "text"}
+    ],
+}
+
+
+def test_survey_spec_written_back_verbatim_into_related() -> None:
+    client, cli = _client()
+    obj = CanonicalObject(
+        "job_templates",
+        {"name": "Deploy", "survey_enabled": True, "survey_spec": _SURVEY},
+        natural_key={"name": "Deploy", "organization": "Default"},
+    )
+    client.import_objects("job_templates", [obj])
+    asset = _sent_bundle(cli)["job_templates"][0]
+    assert asset["survey_enabled"] is True
+    assert asset["related"]["survey_spec"] == _SURVEY
+
+
+def test_no_survey_spec_key_when_absent() -> None:
+    client, cli = _client()
+    client.import_objects("job_templates", [_job_template()])
+    asset = _sent_bundle(cli)["job_templates"][0]
+    assert "survey_spec" not in asset["related"]
 
 
 # -- conflict policy infrastructure -----------------------------------

@@ -56,6 +56,61 @@ def test_type_file_roundtrip(tmp_path: Path) -> None:
     assert result.objects == objects
 
 
+def test_type_file_roundtrip_preserves_credential_references(
+    tmp_path: Path,
+) -> None:
+    """A job template's credential references survive write → read intact."""
+    path = tmp_path / "job_templates.json"
+    objects = [
+        CanonicalObject(
+            "job_templates",
+            {
+                "name": "Deploy",
+                "credentials": [
+                    {
+                        "name": "key-ralf",
+                        "credential_type": {"name": "Machine", "kind": "ssh"},
+                        "organization": None,
+                    }
+                ],
+            },
+            natural_key={"name": "Deploy", "organization": "Default"},
+        )
+    ]
+    write_type_file(path, "job_templates", objects, **_META)
+    result = read_type_file(path)
+
+    assert result.objects == objects
+    assert result.objects[0].fields["credentials"][0]["credential_type"] == {
+        "name": "Machine",
+        "kind": "ssh",
+    }
+
+
+def test_type_file_roundtrip_preserves_survey_spec(tmp_path: Path) -> None:
+    """A job template's survey specification survives write → read verbatim."""
+    path = tmp_path / "job_templates.json"
+    survey = {
+        "name": "S",
+        "description": "",
+        "spec": [
+            {"question_name": "User", "variable": "user", "type": "text"}
+        ],
+    }
+    objects = [
+        CanonicalObject(
+            "job_templates",
+            {"name": "Deploy", "survey_enabled": True, "survey_spec": survey},
+            natural_key={"name": "Deploy", "organization": "Default"},
+        )
+    ]
+    write_type_file(path, "job_templates", objects, **_META)
+    result = read_type_file(path)
+
+    assert result.objects == objects
+    assert result.objects[0].fields["survey_spec"] == survey
+
+
 def test_type_file_persists_natural_key_as_separate_metadata(
     tmp_path: Path,
 ) -> None:

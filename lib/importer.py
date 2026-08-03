@@ -28,6 +28,40 @@ from .export_validator import ExportValidator
 _MANIFEST_FILENAME: str = "manifest.json"
 _DEFAULT_ON_CONFLICT: str = "update"
 
+#: Registry key of the reference-only credentials type.  A ``RelatedRef`` whose
+#: target is this type is subject to the pre-flight existence check.
+_CREDENTIALS_TYPE: str = "credentials"
+
+
+def _cred_identity(ref: object) -> tuple[object, object, object]:
+    """Return ``(name, credential_type, organization)`` for a credential ref.
+
+    Normalises the reduced dict form (``credential_type`` nested as
+    ``{"name", "kind"}``) and a flattened form (plain name) alike, so the same
+    identity is produced regardless of how a reference was stored.
+    """
+    if not isinstance(ref, Mapping):
+        return (None, None, None)
+    name = ref.get("name")
+    ct = ref.get("credential_type")
+    if isinstance(ct, Mapping):
+        ct = ct.get("name")
+    org = ref.get("organization")
+    if isinstance(org, Mapping):
+        org = org.get("name")
+    return (name, ct, org)
+
+
+def _cred_label(ref: object) -> str:
+    """Return a human-readable label for a credential reference."""
+    name, ct, org = _cred_identity(ref)
+    label = f"{name!r}"
+    if ct:
+        label += f" ({ct})"
+    if org:
+        label += f" in org {org!r}"
+    return label
+
 
 class ImportError(RuntimeError):  # noqa: A001 - intentional domain name
     """Raised when an import cannot proceed (e.g. an invalid bundle)."""
@@ -45,6 +79,10 @@ class ImportSummary:
         errors: Non-fatal per-object import errors collected from the client.
         object_count: Total number of objects handed to the client.
         imported_types: Object-type keys that were imported, in import order.
+        referenced_credentials: Labels of credentials referenced by imported
+            objects — the credentials that must already exist in the target.
+        missing_credentials: Labels of referenced credentials that were absent
+            from the target and therefore not re-attached.
     """
 
     created: list[str] = field(default_factory=list)
@@ -54,6 +92,8 @@ class ImportSummary:
     errors: list[str] = field(default_factory=list)
     object_count: int = 0
     imported_types: list[str] = field(default_factory=list)
+    referenced_credentials: list[str] = field(default_factory=list)
+    missing_credentials: list[str] = field(default_factory=list)
 
 
 def _select_objects(
@@ -164,12 +204,95 @@ class Importer:
                 summary.warnings.append(
                     f"no object named {name!r} in type {obj_type.key!r}"
                 )
+            selected = self._resolve_credential_refs(
+                obj_type, selected, summary
+            )
             outcome = self._client.import_objects(
                 obj_type.key, selected, on_conflict=on_conflict
             )
             self._merge(summary, outcome, obj_type.key, len(selected))
 
         return summary
+
+    def _resolve_credential_refs(
+        self,
+        obj_type: ObjectType,
+        objects: Sequence[CanonicalObject],
+        summary: ImportSummary,
+    ) -> list[CanonicalObject]:
+        """Record referenced credentials and drop any absent from the target.
+
+        For every ``RelatedRef`` targeting credentials, the referenced
+        credentials are recorded on the summary (they must pre-exist in the
+        target).  A pre-flight query then determines which are missing; those
+        references are stripped from the objects and reported as warnings, so
+        the object still imports without a hard awxkit failure.
+        """
+        cred_fields = [
+            rref.canonical_field
+            for rref in obj_type.related_refs
+            if rref.target_type == _CREDENTIALS_TYPE
+        ]
+        if not cred_fields:
+            return list(objects)
+
+        all_refs: list[Mapping[str, object]] = []
+        seen: set[tuple[object, object, object]] = set()
+        for obj in objects:
+            for cred_field in cred_fields:
+                for ref in obj.fields.get(cred_field) or []:
+                    ident = _cred_identity(ref)
+                    if ident not in seen:
+                        seen.add(ident)
+                        all_refs.append(ref)
+                        label = _cred_label(ref)
+                        if label not in summary.referenced_credentials:
+                            summary.referenced_credentials.append(label)
+        if not all_refs:
+            return list(objects)
+
+        missing_ids = {
+            _cred_identity(ref)
+            for ref in self._client.missing_credentials(all_refs)
+        }
+        if not missing_ids:
+            return list(objects)
+
+        result: list[CanonicalObject] = []
+        for obj in objects:
+            new_fields = dict(obj.fields)
+            changed = False
+            for cred_field in cred_fields:
+                refs = new_fields.get(cred_field)
+                if not isinstance(refs, list):
+                    continue
+                kept = []
+                for ref in refs:
+                    if _cred_identity(ref) in missing_ids:
+                        changed = True
+                        label = _cred_label(ref)
+                        if label not in summary.missing_credentials:
+                            summary.missing_credentials.append(label)
+                        summary.warnings.append(
+                            f"object {obj.fields.get('name')!r} references "
+                            f"credential {label} which is not present in the "
+                            "target; attach it manually or import the "
+                            "credential first"
+                        )
+                    else:
+                        kept.append(ref)
+                if len(kept) != len(refs):
+                    new_fields[cred_field] = kept
+            result.append(
+                CanonicalObject(
+                    type=obj.type,
+                    fields=new_fields,
+                    natural_key=obj.natural_key,
+                )
+                if changed
+                else obj
+            )
+        return result
 
     # ------------------------------------------------------------------
     # Internals
