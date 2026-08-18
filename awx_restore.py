@@ -328,16 +328,22 @@ def _quiesce_awx(kubectl: Kubectl) -> dict[str, int]:
 def _resume_awx(kubectl: Kubectl, replicas: dict[str, int]) -> None:
     """Scale AWX deployments back to their captured replica counts.
 
-    Web and task are restored first, then the operator, so the operator
-    resumes reconciliation against an already-consistent set of deployments.
-    Best-effort: failures are logged as warnings, never raised.
+    Web and task are restored first (best-effort — the operator owns their
+    replica counts via ``task_manage_replicas`` and reconciles them once it is
+    running), then the operator.  Scaling the *operator* back up is fatal on
+    failure and re-raised: without a running operator nothing reconciles
+    web/task, so the restore must not continue as if it had succeeded.
 
     Args:
         kubectl: Initialised Kubectl instance.
         replicas: Mapping returned by :func:`_quiesce_awx`.
+
+    Raises:
+        KubectlError: If the operator deployment cannot be scaled back up.
     """
     log.info("Scaling AWX back up: %s", replicas)
-    for name in ("awx-web", "awx-task", _OPERATOR_DEPLOYMENT):
+    # Web/task first (best-effort): the operator will reconcile them once up.
+    for name in ("awx-web", "awx-task"):
         target = replicas.get(name, 1)
         try:
             kubectl.scale("deployment", name, target)
@@ -346,6 +352,10 @@ def _resume_awx(kubectl: Kubectl, replicas: dict[str, int]) -> None:
                 "Could not scale deployment '%s' back to %d: %s",
                 name, target, exc,
             )
+    # The operator is the control plane that reconciles web/task; a failure to
+    # scale it back up must abort the restore, not vanish as a warning.
+    op_target = replicas.get(_OPERATOR_DEPLOYMENT, 1)
+    kubectl.scale("deployment", _OPERATOR_DEPLOYMENT, op_target)
 
 
 def _resume_awx_after_failure(
@@ -372,7 +382,67 @@ def _resume_awx_after_failure(
         "Restore failed after AWX was scaled down — "
         "attempting to restore replica counts."
     )
-    _resume_awx(kubectl, replicas)
+    try:
+        _resume_awx(kubectl, replicas)
+    except KubectlError as exc:
+        # Already in the failure path: the now-fatal operator scale must not
+        # mask the original error nor prevent the caller's sys.exit().
+        log.warning("Best-effort resume after failure did not complete: %s", exc)
+
+
+def _assert_replicas_positive(kubectl: Kubectl, name: str) -> None:
+    """Raise unless a deployment is configured for at least one replica.
+
+    A Deployment scaled to ``replicas: 0`` reports ``condition=Available=True``
+    (minimum availability is trivially satisfied with no pods), so a bare
+    readiness check would pass for a deployment that has no pods at all.  This
+    guards against exactly the observed failure mode where ``awx-task`` stays
+    at ``replicas: 0`` after the operator fails to reconcile it.
+
+    Raises:
+        KubectlError: If the deployment has fewer than one desired replica.
+    """
+    replicas = kubectl.get_replicas("deployment", name)
+    if replicas < 1:
+        raise KubectlError(
+            f"Deployment '{name}' is scaled to {replicas} replica(s); "
+            f"expected at least 1 — AWX is not fully restored."
+        )
+
+
+def _verify_deployment_ready(
+    kubectl: Kubectl,
+    name: str,
+    selector: str,
+    description: str,
+    *,
+    timeout: int = 300,
+) -> None:
+    """Confirm a managed AWX deployment has a Running, Ready pod.
+
+    Reuses the existing wait helpers rather than adding a new health check:
+      * :func:`_assert_replicas_positive` makes the ">0 replicas" expectation
+        explicit and fails fast (not only via the pod-wait timeout).
+      * ``wait_for_pod`` blocks until at least one *Running* pod exists — this
+        fails via timeout if the deployment is stuck at ``replicas: 0``.
+      * ``wait_for_deployment_available`` confirms the pod passed its readiness
+        probe (``condition=Available``).
+
+    Args:
+        kubectl: Initialised Kubectl instance.
+        name: Deployment name.
+        selector: Label selector for the deployment's pods.
+        description: Human-readable component name for log lines.
+        timeout: Maximum wait per underlying step, in seconds.
+
+    Raises:
+        KubectlError: If the deployment is not Running/Ready within *timeout*.
+    """
+    log.info("Waiting for AWX %s...", description)
+    _assert_replicas_positive(kubectl, name)
+    kubectl.wait_for_pod(selector, timeout=timeout)
+    kubectl.wait_for_deployment_available(name, timeout=timeout)
+    log.info("AWX %s Ready", description)
 
 
 def main() -> None:
@@ -394,6 +464,10 @@ def main() -> None:
     original_replicas: dict[str, int] | None = None
     # Bound in Step 6; kept in the outer scope so the error handler can use it.
     kubectl: Kubectl | None = None
+    # True once the database has been restored: lets the error handler
+    # distinguish a pre-DB failure (exit 1) from a post-DB control-plane
+    # failure where AWX did not fully recover (exit 2, degraded).
+    db_restored = False
 
     try:
         # Step 1 — Extract archive
@@ -486,6 +560,8 @@ def main() -> None:
             password=pg_cfg["password"],
             database=pg_cfg["database"],
         )
+        db_restored = True
+        log.info("Database restore completed")
 
         # Step 11 — Optional registry restore, performed while AWX is still
         # scaled to zero and *before* AWX is scaled back up.  The restore is
@@ -509,13 +585,28 @@ def main() -> None:
             log.info("Ensuring k3s registry mirror for the target registry")
             K3sRegistryMirror(kubectl).ensure_mirror(rewrite_cfg.target)
 
-        # Step 11b — Scale AWX back up to its captured replica counts
+        # Step 11b — Scale AWX back up to its captured replica counts.
+        # original_replicas is intentionally NOT cleared here: the cluster is
+        # only truly "resumed" once operator, web and task are verified Ready
+        # (Step 12).  Clearing it now would stop _resume_awx_after_failure from
+        # running if the verification below fails.
         _resume_awx(kubectl, original_replicas)
-        original_replicas = None  # resumed; nothing owed to the error handler
 
-        # Step 11c — Wait for AWX web pod
-        log.info("Waiting for AWX")
-        kubectl.wait_for_pod("app.kubernetes.io/name=awx-web")
+        # Step 11b-2 — Operator must be Running/Ready before web/task: with
+        # task_manage_replicas=true it is the only actor that reconciles them
+        # back to the CR replica count.  Uses the existing operator resolver
+        # (selector + name-prefix fallback) rather than a hard-coded selector.
+        log.info("Waiting for AWX operator...")
+        _assert_replicas_positive(kubectl, _OPERATOR_DEPLOYMENT)
+        kubectl.wait_for_deployment_available(_OPERATOR_DEPLOYMENT)
+        kubectl.operator_pod()  # confirms a Running operator pod exists
+        log.info("AWX operator Ready")
+
+        # Step 11c — Web must be Running/Ready before the EE rewrite below
+        # execs awx-manage inside the web pod.
+        _verify_deployment_ready(
+            kubectl, "awx-web", "app.kubernetes.io/name=awx-web", "web"
+        )
 
         # Step 11d — Rewrite registry prefixes in Execution Environments
         # Runs after the web pod is Running so that awx-manage shell can
@@ -532,11 +623,17 @@ def main() -> None:
         else:
             log.debug("Registry rewrite not requested — skipping.")
 
-        # Step 12 — Optionally wait for task pod (best-effort)
-        try:
-            kubectl.wait_for_pod("app.kubernetes.io/name=awx-task")
-        except KubectlError as exc:
-            log.warning("AWX task pod did not become Running: %s", exc)
+        # Step 12 — Final consistency check: the task deployment must be
+        # Running/Ready too.  A task deployment stuck at replicas:0 fails here
+        # instead of being swallowed as a best-effort warning — without a task
+        # pod AWX cannot execute any jobs.
+        _verify_deployment_ready(
+            kubectl, "awx-task", "app.kubernetes.io/name=awx-task", "task"
+        )
+
+        # Operator, web and task all verified Running/Ready — the cluster is
+        # genuinely resumed, so only now is nothing owed to the failure handler.
+        original_replicas = None
 
         # Step 13 — Cleanup
         if not args.keep_temp:
@@ -545,7 +642,7 @@ def main() -> None:
         else:
             log.info("Temporary directory kept: '%s'", tmp_dir)
 
-        log.info("Restore completed successfully — ID: %s", restore_id)
+        log.info("AWX restore completed successfully — ID: %s", restore_id)
         log.info(
             "\n"
             "AWX has been started successfully.\n"
@@ -568,10 +665,25 @@ def main() -> None:
         ManifestError,
         MigrationError,
     ) as exc:
+        if db_restored:
+            log.error(
+                "Database restore completed, but AWX did not fully recover "
+                "(control plane not Ready): %s",
+                exc,
+            )
+            _resume_awx_after_failure(kubectl, original_replicas)
+            sys.exit(2)
         log.error("Restore failed: %s", exc)
         _resume_awx_after_failure(kubectl, original_replicas)
         sys.exit(1)
     except Exception as exc:
+        if db_restored:
+            log.error(
+                "Database restore completed, but AWX did not fully recover: %s",
+                exc,
+            )
+            _resume_awx_after_failure(kubectl, original_replicas)
+            sys.exit(2)
         log.error("Unexpected error: %s", exc)
         _resume_awx_after_failure(kubectl, original_replicas)
         sys.exit(1)
