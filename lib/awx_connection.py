@@ -18,8 +18,10 @@ Host priority (highest first):
 2. NodePort derivation from the AWX service plus a cluster node IP — the same
    approach the restore uses for the registry service.
 """
-
 from __future__ import annotations
+import base64
+import json
+import os
 
 from dataclasses import dataclass, field
 from typing import Any
@@ -182,30 +184,36 @@ def _read_admin_password(kubectl: Kubectl) -> str:
 
 
 def resolve_connection(kubectl: Kubectl, args: Any) -> AwxConnection:
-    """Resolve an :class:`AwxConnection` from CLI *args* and the cluster.
+    """Resolve an :class:`AwxConnection` from CLI args, environment, and cluster.
 
-    *args* is read via :func:`getattr` so any namespace-like object works
-    (argparse namespace, ``SimpleNamespace``, …).  Recognised attributes:
-    ``awx_host``, ``awx_username``, ``awx_password``, ``awx_token``,
-    ``insecure``.
-
-    Args:
-        kubectl: Kubectl wrapper bound to the AWX namespace (used only for the
-            NodePort host fallback and the admin-password Secret fallback).
-        args: Object carrying the CLI options listed above.
-
-    Returns:
-        A fully populated :class:`AwxConnection`.
-
-    Raises:
-        AwxConnectionError: If the host or credentials cannot be resolved.
+    Precedence:
+        1. Explicit CLI options
+        2. CONTROLLER_* / TOWER_* environment variables
+        3. Kubernetes NodePort / admin Secret fallback
     """
     verify_ssl = not bool(getattr(args, "insecure", False))
 
+    # ------------------------------------------------------------------
+    # Host
+    # ------------------------------------------------------------------
     host = getattr(args, "awx_host", None)
-    host = host.rstrip("/") if host else _derive_host(kubectl)
 
+    if not host:
+        host = (
+            os.environ.get("CONTROLLER_HOST")
+            or os.environ.get("TOWER_HOST")
+        )
+
+    if not host:
+        host = _derive_host(kubectl)
+
+    host = host.rstrip("/")
+
+    # ------------------------------------------------------------------
+    # Explicit token
+    # ------------------------------------------------------------------
     token = getattr(args, "awx_token", None)
+
     if token:
         return AwxConnection(
             host=host,
@@ -215,8 +223,54 @@ def resolve_connection(kubectl: Kubectl, args: Any) -> AwxConnection:
             verify_ssl=verify_ssl,
         )
 
-    username = getattr(args, "awx_username", None) or AWX_ADMIN_USER
+    # ------------------------------------------------------------------
+    # Environment token
+    # ------------------------------------------------------------------
+    token = (
+        os.environ.get("CONTROLLER_OAUTH_TOKEN")
+        or os.environ.get("TOWER_OAUTH_TOKEN")
+    )
+
+    if token:
+        env_verify = (
+            os.environ.get("CONTROLLER_VERIFY_SSL")
+            or os.environ.get("TOWER_VERIFY_SSL")
+        )
+
+        if env_verify is not None and not getattr(args, "insecure", False):
+            verify_ssl = env_verify.lower() not in {
+                "false",
+                "0",
+                "no",
+                "off",
+            }
+
+        return AwxConnection(
+            host=host,
+            username=None,
+            password=None,
+            token=token,
+            verify_ssl=verify_ssl,
+        )
+
+    # ------------------------------------------------------------------
+    # Username / password
+    # ------------------------------------------------------------------
+    username = (
+        getattr(args, "awx_username", None)
+        or os.environ.get("CONTROLLER_USERNAME")
+        or os.environ.get("TOWER_USERNAME")
+        or AWX_ADMIN_USER
+    )
+
     password = getattr(args, "awx_password", None)
+
+    if not password:
+        password = (
+            os.environ.get("CONTROLLER_PASSWORD")
+            or os.environ.get("TOWER_PASSWORD")
+        )
+
     if not password:
         password = _read_admin_password(kubectl)
 
@@ -227,7 +281,6 @@ def resolve_connection(kubectl: Kubectl, args: Any) -> AwxConnection:
         token=None,
         verify_ssl=verify_ssl,
     )
-
 
 # Namespace default is exposed for callers that build their own Kubectl.
 DEFAULT_NAMESPACE: str = NAMESPACE

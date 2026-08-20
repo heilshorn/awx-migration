@@ -79,3 +79,7 @@ and this project adheres to
   export/import work is additive.
 - Export bundles **never contain secrets** and are not a substitute for a full
   backup.
+
+## [2.1.2] - 2026-08-20
+
+- div bugfixing
