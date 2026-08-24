@@ -87,3 +87,9 @@ and this project adheres to
 ## [2.1.3] - 2026-08-24
 
 - Bug fix for when a template with different credentials is present during import.
+
+## [2.1.4] - 2026-08-24
+
+Fixed: AWX Restore could leave the AWX Operator, Web and Task deployments scaled to zero after a failed restore. The restore workflow now guarantees at least one replica for all required AWX control-plane deployments during recovery and verifies that Operator, Web and Task are Ready before considering the restore successful.
+
+

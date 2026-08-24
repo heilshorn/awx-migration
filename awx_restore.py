@@ -276,43 +276,44 @@ _AWX_CLIENT_SELECTORS: tuple[str, ...] = (
 
 
 def _quiesce_awx(kubectl: Kubectl) -> dict[str, int]:
-    """Scale AWX deployments to zero so nothing holds a DB connection.
-
-    A running AWX web/task pod reconnects to PostgreSQL within milliseconds of
-    having its session terminated, which makes ``DROP DATABASE`` impossible.
-    This captures each deployment's current replica count, scales the operator
-    down first (so it cannot reconcile the others back up), then scales web and
-    task to zero, and finally waits for the client pods to terminate.
-
-    Every step is best-effort: failures are logged as warnings rather than
-    raised, so a naming mismatch does not abort the restore (``DROP DATABASE
-    ... WITH (FORCE)`` still provides a fallback).
-
-    Args:
-        kubectl: Initialised Kubectl instance.
-
-    Returns:
-        Mapping of deployment name to its original replica count, for use by
-        :func:`_resume_awx`.
-    """
+    """Scale AWX deployments to zero so nothing holds a DB connection."""
     log.info("Scaling AWX down for the database restore")
+
     original: dict[str, int] = {}
+
     for name in _AWX_DEPLOYMENTS:
         try:
             original[name] = kubectl.get_replicas("deployment", name)
         except KubectlError as exc:
             log.warning(
                 "Could not read replica count of '%s' (assuming 1): %s",
-                name, exc,
+                name,
+                exc,
             )
             original[name] = 1
+
     log.info("Captured replica counts: %s", original)
+
+    zero_replicas = [
+        name for name, count in original.items()
+        if count < 1
+    ]
+    if zero_replicas:
+        log.warning(
+            "AWX deployment(s) already had zero replicas before restore: %s. "
+            "They will be started with at least one replica during resume.",
+            ", ".join(zero_replicas),
+        )
 
     for name in _AWX_DEPLOYMENTS:
         try:
             kubectl.scale("deployment", name, 0)
         except KubectlError as exc:
-            log.warning("Could not scale down deployment '%s': %s", name, exc)
+            log.warning(
+                "Could not scale down deployment '%s': %s",
+                name,
+                exc,
+            )
 
     for selector in _AWX_CLIENT_SELECTORS:
         try:
@@ -320,19 +321,24 @@ def _quiesce_awx(kubectl: Kubectl) -> dict[str, int]:
         except KubectlError as exc:
             log.warning(
                 "Pods matching '%s' did not terminate in time: %s",
-                selector, exc,
+                selector,
+                exc,
             )
+
     return original
 
-
 def _resume_awx(kubectl: Kubectl, replicas: dict[str, int]) -> None:
-    """Scale AWX deployments back to their captured replica counts.
+    """Scale AWX deployments back up after the database restore.
 
-    Web and task are restored first (best-effort — the operator owns their
-    replica counts via ``task_manage_replicas`` and reconciles them once it is
-    running), then the operator.  Scaling the *operator* back up is fatal on
-    failure and re-raised: without a running operator nothing reconciles
-    web/task, so the restore must not continue as if it had succeeded.
+    A restore must leave AWX operational.  Therefore every AWX control-plane
+    deployment is restored to at least one replica, even when the captured
+    replica count was already zero.  In particular, the operator must never
+    remain at zero because it is responsible for reconciling the AWX
+    deployment.
+
+    Web and task are restored first on a best-effort basis; the operator is
+    then brought up and takes over reconciliation.  The effective replica
+    count is always at least one.
 
     Args:
         kubectl: Initialised Kubectl instance.
@@ -342,21 +348,48 @@ def _resume_awx(kubectl: Kubectl, replicas: dict[str, int]) -> None:
         KubectlError: If the operator deployment cannot be scaled back up.
     """
     log.info("Scaling AWX back up: %s", replicas)
-    # Web/task first (best-effort): the operator will reconcile them once up.
+
+    # A restore must never leave an AWX deployment at zero.  This is
+    # especially important for the operator: with zero operator replicas
+    # nothing can reconcile the AWX custom resource back to a healthy state.
     for name in ("awx-web", "awx-task"):
-        target = replicas.get(name, 1)
+        captured = replicas.get(name, 1)
+        target = max(1, captured)
+
+        if captured < 1:
+            log.warning(
+                "Captured replica count for '%s' was %d; "
+                "using %d replica for restore",
+                name,
+                captured,
+                target,
+            )
+
         try:
             kubectl.scale("deployment", name, target)
         except KubectlError as exc:
             log.warning(
                 "Could not scale deployment '%s' back to %d: %s",
-                name, target, exc,
+                name,
+                target,
+                exc,
             )
-    # The operator is the control plane that reconciles web/task; a failure to
-    # scale it back up must abort the restore, not vanish as a warning.
-    op_target = replicas.get(_OPERATOR_DEPLOYMENT, 1)
-    kubectl.scale("deployment", _OPERATOR_DEPLOYMENT, op_target)
 
+    # The operator is the control plane that reconciles web/task.  Never
+    # restore it to zero, even when the captured value was zero.
+    captured_operator = replicas.get(_OPERATOR_DEPLOYMENT, 1)
+    op_target = max(1, captured_operator)
+
+    if captured_operator < 1:
+        log.warning(
+            "Captured replica count for '%s' was %d; "
+            "using %d replica for restore",
+            _OPERATOR_DEPLOYMENT,
+            captured_operator,
+            op_target,
+        )
+
+    kubectl.scale("deployment", _OPERATOR_DEPLOYMENT, op_target)
 
 def _resume_awx_after_failure(
     kubectl: Kubectl | None,
