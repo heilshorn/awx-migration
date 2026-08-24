@@ -602,6 +602,168 @@ class AwxCliClient(AwxClient):
             type=obj_type.key, fields=fields, natural_key=natural_key
         )
 
+    def _find_existing_job_template(
+        self,
+        canonical: CanonicalObject,
+    ) -> dict[str, Any] | None:
+        """Return the existing AWX job-template asset matching *canonical*.
+
+        The AWX CLI exposes the credential associations in
+        ``summary_fields.credentials``.  We need the actual resource ID so
+        that credentials can be temporarily disassociated before an update.
+        """
+
+        if canonical.natural_key is None:
+            return None
+
+        name = canonical.natural_key.get("name")
+        organization = canonical.natural_key.get("organization")
+
+        if not isinstance(name, str):
+            return None
+
+        out = self._run(
+            ["job_templates", "list", "-f", "json"]
+        )
+
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError as exc:
+            raise AwxClientError(
+                f"Could not parse 'awx job_templates list' output: {exc}"
+            ) from exc
+
+        if isinstance(data, Mapping):
+            candidates = data.get("results", [])
+        elif isinstance(data, list):
+            candidates = data
+        else:
+            raise AwxClientError(
+                "Unexpected 'awx job_templates list' output shape: "
+                f"{type(data).__name__}"
+            )
+
+        for item in candidates:
+            if not isinstance(item, Mapping):
+                continue
+
+            if item.get("name") != name:
+                continue
+
+            summary = item.get("summary_fields")
+            if not isinstance(summary, Mapping):
+                continue
+
+            org = summary.get("organization")
+            existing_org = (
+                org.get("name")
+                if isinstance(org, Mapping)
+                else None
+            )
+
+            if organization is not None and existing_org != organization:
+                continue
+
+            return dict(item)
+
+        return None
+
+    def _job_template_credentials(
+        self,
+        asset: Mapping[str, Any],
+    ) -> list[str]:
+        """Return credential names currently associated with a job template."""
+
+        summary = asset.get("summary_fields")
+        if not isinstance(summary, Mapping):
+            return []
+
+        credentials = summary.get("credentials")
+        if not isinstance(credentials, list):
+            return []
+
+        result: list[str] = []
+        for credential in credentials:
+            if not isinstance(credential, Mapping):
+                continue
+
+            name = credential.get("name")
+            if isinstance(name, str) and name:
+                result.append(name)
+
+        return result
+
+    def _credential_names_from_canonical(
+        self,
+        canonical: CanonicalObject,
+    ) -> list[str]:
+        """Return credential names from a canonical job-template object."""
+
+        values = canonical.fields.get("credentials")
+        if not isinstance(values, (list, tuple)):
+            return []
+
+        result: list[str] = []
+
+        for value in values:
+            if isinstance(value, str):
+                result.append(value)
+                continue
+
+            if isinstance(value, Mapping):
+                name = value.get("name")
+                if isinstance(name, str) and name:
+                    result.append(name)
+
+        return result
+
+    def _disassociate_job_template_credentials(
+        self,
+        job_template_id: int | str,
+        credentials: Sequence[str],
+    ) -> None:
+        """Temporarily remove all credentials from a job template."""
+
+        for credential in credentials:
+            log.debug(
+                "Disassociating credential %r from job template %r",
+                credential,
+                job_template_id,
+            )
+            self._run(
+                [
+                    "job_templates",
+                    "disassociate",
+                    "--credential",
+                    credential,
+                    str(job_template_id),
+                ]
+            )
+
+    def _associate_job_template_credentials(
+        self,
+        job_template_id: int | str,
+        credentials: Sequence[str],
+    ) -> None:
+        """Associate credentials with a job template."""
+
+        for credential in credentials:
+            log.debug(
+                "Associating credential %r with job template %r",
+                credential,
+                job_template_id,
+            )
+            self._run(
+                [
+                    "job_templates",
+                    "associate",
+                    "--credential",
+                    credential,
+                    str(job_template_id),
+                ]
+            )
+
+
     def import_objects(
         self,
         object_type: str,
@@ -648,18 +810,136 @@ class AwxCliClient(AwxClient):
         if not objects:
             return result
 
+        # Job templates need special handling for credential associations.
+        #
+        # awx import treats related.credentials as additive associations.
+        # AWX allows only one Machine credential per job template, therefore
+        # importing a job template that already has a different Machine
+        # credential fails with:
+        #
+        #   Cannot assign multiple Machine credentials.
+        #
+        # For existing job templates we temporarily remove the current
+        # credential associations, import the object without credentials,
+        # and restore the desired associations afterwards.
+        existing_job_template: dict[str, Any] | None = None
+        old_credentials: list[str] = []
+        desired_credentials: list[str] = []
+        credential_update = False
+
+        if obj_type.key == "job_templates" and len(objects) == 1:
+            canonical = objects[0]
+
+            try:
+                existing_job_template = self._find_existing_job_template(
+                    canonical
+                )
+            except (AwxClientError, AwxCliError) as exc:
+                log.debug(
+                    "Could not determine existing job template: %s",
+                    exc,
+                )
+
+            if existing_job_template is not None:
+                old_credentials = self._job_template_credentials(
+                    existing_job_template
+                )
+                desired_credentials = self._credential_names_from_canonical(
+                    canonical
+                )
+                credential_update = True
+
+                log.debug(
+                    "Existing job template %r found (id=%s)",
+                    canonical.natural_key.get("name")
+                    if canonical.natural_key
+                    else "?",
+                    existing_job_template.get("id"),
+                )
+                log.debug(
+                    "Existing credentials: %s",
+                    old_credentials,
+                )
+                log.debug(
+                    "Desired credentials: %s",
+                    desired_credentials,
+                )
+
+                job_template_id = existing_job_template.get("id")
+                if job_template_id is None:
+                    raise AwxClientError(
+                        "Existing job template has no usable ID"
+                    )
+
+                self._disassociate_job_template_credentials(
+                    job_template_id,
+                    old_credentials,
+                )
+
+        assets = [self._to_awx(obj_type, o) for o in objects]
+
+        if credential_update:
+            # Credentials are handled explicitly below.  Do not let
+            # awx import perform an additive association.
+            for asset in assets:
+                related = asset.get("related")
+                if isinstance(related, Mapping):
+                    related = dict(related)
+                    related.pop("credentials", None)
+                    asset["related"] = related
+
         bundle = {
-            obj_type.awx_type: [self._to_awx(obj_type, o) for o in objects]
+            obj_type.awx_type: assets
         }
         payload = json.dumps(bundle)
 
         try:
             self._run(["import"], stdin=payload)
         except AwxCliError as exc:
+            # Try to restore the previous state if the actual import failed.
+            if credential_update and existing_job_template is not None:
+                job_template_id = existing_job_template.get("id")
+                if job_template_id is not None:
+                    try:
+                        self._associate_job_template_credentials(
+                            job_template_id,
+                            old_credentials,
+                        )
+                    except AwxCliError as restore_exc:
+                        log.error(
+                            "Could not restore previous credentials for "
+                            "job template %r: %s",
+                            job_template_id,
+                            restore_exc,
+                        )
+
             result.errors.append(
                 f"awx import failed for {obj_type.key!r}: {exc}"
             )
             return result
+
+        # Re-attach the credentials requested by the imported object.
+        if credential_update and existing_job_template is not None:
+            job_template_id = existing_job_template.get("id")
+
+            if job_template_id is None:
+                result.errors.append(
+                    "Job template was imported, but its ID could not be "
+                    "determined for credential association"
+                )
+                return result
+
+            try:
+                self._associate_job_template_credentials(
+                    job_template_id,
+                    desired_credentials,
+                )
+            except AwxCliError as exc:
+                result.errors.append(
+                    "Job template was imported, but credential "
+                    f"association failed: {exc}"
+                )
+                return result
 
         if on_conflict != "update":
             result.warnings.append(
