@@ -83,3 +83,7 @@ and this project adheres to
 ## [2.1.2] - 2026-08-20
 
 - div bugfixing
+
+## [2.1.3] - 2026-08-24
+
+- Bug fix for when a template with different credentials is present during import.

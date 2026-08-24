@@ -32,7 +32,7 @@ from lib.exporter import ExportError, Exporter, ExportSummary
 from lib.logger import setup_logger
 from lib import utils
 
-VERSION = "2.1.2"
+VERSION = "2.1.3"
 
 # Object types selectable on the CLI: reference-only types (e.g. credentials)
 # are excluded — they exist only to describe another type's natural key and are
