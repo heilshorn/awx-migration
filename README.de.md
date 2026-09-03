@@ -54,6 +54,8 @@ awx job list
 
 Auflistung der Jobs in AWX mit den entsprechenden Infos. Jedoch nur eine Seite, alle mit awx job list –all
 
+Die Installation von AWXKit ist Vorraussetzung für den Ex- Und Import von AWX-Objekten, da dort AWX-Befehle genutzt werden.
+
 -----
 
 Ex- und Import von AWX-Objekten
